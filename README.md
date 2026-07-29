@@ -63,6 +63,30 @@ force-load chunks, so results are still bounded by the server's loaded-chunk
 distance. There is no peripheral cooldown; the calling CraftOS program controls
 the scan rate.
 
+### `scanBatch(requests, maxChunks, budgetMicros)`
+
+Scans several already-loaded chunks in one server-thread call. `requests` is
+an array of `{ dx, dz }` offsets or `{ chunkX, chunkZ }` absolute chunk
+coordinates. One call accepts up to 96 candidates, completes at most 16
+chunks, and clamps its server-thread budget to 0.5–8 milliseconds. Unloaded
+and budget-deferred requests are returned separately:
+
+```lua
+local result = surveyor.scanBatch({
+  { dx = 0, dz = 0 },
+  { dx = 0, dz = -1 },
+  { dx = 1, dz = -1 }
+}, 16, 8000)
+
+print("scanned", #result.tiles)
+print("not loaded", #result.unloaded)
+print("deferred", #result.deferred)
+```
+
+ATLAS automatically expands to the full 16-chunk/8 ms batch while the
+aircraft is moving quickly. At lower speeds it uses the configured, gentler
+budget.
+
 The scan runs on the Minecraft server thread and returns:
 
 ```lua
@@ -177,6 +201,15 @@ allay install atlas-navigator
 atlas-navigator
 ```
 
+An empty data disk in any attached onboard disk drive is automatically
+initialized as an `ATLAS AIR CACHE`. The computer filesystem and every attached
+air-cache disk form one storage pool; capacity is detected at runtime. Station
+tiles are mirrored in the background even when they are outside the visible
+map. Flight-corridor and nearby tiles always outrank the background mirror.
+When storage pressure requires replacement, synchronized distant tiles are
+evicted first. Newly surveyed data is pinned until the station confirms that
+it has stored the same checksum.
+
 `atlas-station` and `atlas-navigator` both depend on `atlas-core`, which Allay
 installs and updates automatically. The package manifests pin SHA-256 hashes
 for every downloaded Lua file.
@@ -215,14 +248,24 @@ by other aircraft, and only surveys after the station explicitly reports that a
 tile is missing. Known tiles are never automatically rescanned; `R` is the
 explicit resurvey command.
 
-The navigator polls position and redraws at the Minecraft tick rate. Each poll
-can scan up to four station-confirmed missing chunks. Network downloads use
-checksum-aware batches with bounded in-flight requests, and zoomed-out viewport
-prefetch uses an incremental center-out walk so it does not stall the UI by
-examining the entire visible world at once. The station storage screen provides
-clickable maintenance controls and expanded details for the selected disk. If
-only a wired modem is present, the station remains usable in `WIRED` mode and
-automatically enables wireless service when an Ender Modem is attached.
+The navigator polls position and redraws at the Minecraft tick rate. At speed,
+the native surveyor scans up to 16 station-confirmed missing chunks per poll
+inside an 8 ms server-thread budget and prioritizes a narrow forward corridor.
+Disk writes run in a separate buffered worker. The footer reports measured
+chunks per second, scan backlog, and mapped seconds ahead.
+
+ATLAS Link requests windows of up to 98 terrain tiles. The station streams
+those as reliable 14-tile segments with three segments in flight, per-segment
+acknowledgements, and automatic retry. Survey uploads use 14-tile batches too.
+The station exposes a paged map catalog, allowing every connected aircraft to
+mirror the shared map independently of its current viewport. The navigator
+keeps at least a 24-chunk local cache circle, extends a speed-dependent forward
+cone as far as 64 chunks, and prioritizes all entered waypoint corridors.
+
+The station storage screen provides clickable maintenance controls and
+expanded details for the selected disk. If only a wired modem is present, the
+station remains usable in `WIRED` mode and automatically enables wireless
+service when an Ender Modem is attached.
 
 Unsynced terrain remains in the aircraft cache. Deferred, rejected, or timed
 out uploads retry automatically with exponential backoff, capped at 30 seconds,

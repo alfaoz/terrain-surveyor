@@ -1,7 +1,7 @@
 return {
     name = "atlas-station",
-    version = "1.2.0",
-    description = "ATLAS shared terrain database, storage rack, and traffic server",
+    version = "1.3.0",
+    description = "ATLAS streaming terrain database, storage rack, and traffic server",
     author = "alfaoz",
 
     base_url = "https://raw.githubusercontent.com/alfaoz/terrain-surveyor/main/atlas",
@@ -13,7 +13,7 @@ return {
     },
 
     hashes = {
-        ["station.lua"] = "6c6218c51937952e0050c5c86ebe49941db4ea1982a5400353a138663156ab79"
+        ["station.lua"] = "4ab8142947f31968f9c8f13c5d0257c48d4dfeaa928882ef74e7712f9df19725"
     },
 
     dependencies = { "atlas-core" },

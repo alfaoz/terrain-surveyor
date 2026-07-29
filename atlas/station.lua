@@ -8,6 +8,16 @@ local UI_REFRESH_SECONDS = 0.10
 local TRAFFIC_STALE_MS = 5000
 local TRAFFIC_REMOVE_MS = 15000
 local MAX_BULK_REQUEST_TILES = 16
+local MAX_BULK_UPLOAD_TILES = 14
+local MAX_WINDOW_REQUEST_TILES = 98
+local WINDOW_SEGMENT_TILES = 14
+local WINDOW_SEGMENT_CONCURRENCY = 3
+local WINDOW_RETRY_MS = 900
+local WINDOW_MAX_ATTEMPTS = 8
+local WINDOW_EXPIRE_MS = 30000
+local CATALOG_PAGE_SIZE = 256
+local INDEX_FLUSH_MS = 5000
+local INDEX_DIRTY_MARKER = "atlas/index.dirty"
 
 local config = atlas.readTable(CONFIG_PATH) or {}
 config.name = config.name or ("ATLAS-" .. os.getComputerID())
@@ -29,6 +39,12 @@ local radioState = "NO MODEM"
 local radioDetail = "No modem detected"
 local hostedName
 local networkHosted = false
+local windowTransfers = {}
+local catalogRevision = 1
+local catalogKeys
+local catalogDirty = true
+local catalogBuiltAt = 0
+local dirtyVolumeIndexes = {}
 local stats = {
     uploads = 0,
     downloads = 0,
@@ -166,12 +182,15 @@ end
 local function loadVolumeIndex(volume)
     local path = fs.combine(volume.mount, atlas.VOLUME_INDEX)
     local index = atlas.readTable(path)
-    if type(index) ~= "table"
+    local dirtyPath = fs.combine(volume.mount, INDEX_DIRTY_MARKER)
+    if fs.exists(dirtyPath)
+        or type(index) ~= "table"
         or index.format ~= atlas.VOLUME_FORMAT
         or index.volumeId ~= volume.id
         or type(index.tiles) ~= "table" then
         log("Rebuilding index for " .. volume.label, "WARN")
         index = rebuildVolumeIndex(volume)
+        if fs.exists(dirtyPath) then pcall(fs.delete, dirtyPath) end
     end
     return index
 end
@@ -223,12 +242,12 @@ local function classifyDrive(entry)
 end
 
 local function rebuildGlobalIndex()
-    tileIndex = {}
+    local nextIndex = {}
     for volumeId, volume in pairs(volumes) do
         for key, entry in pairs(volume.index.tiles) do
-            local current = tileIndex[key]
+            local current = nextIndex[key]
             if not current or (entry.storedAt or 0) > (current.storedAt or 0) then
-                tileIndex[key] = {
+                nextIndex[key] = {
                     volumeId = volumeId,
                     path = entry.path,
                     checksum = entry.checksum,
@@ -237,6 +256,21 @@ local function rebuildGlobalIndex()
                 }
             end
         end
+    end
+
+    local changed = tableCount(nextIndex) ~= tableCount(tileIndex)
+    if not changed then
+        for key, entry in pairs(nextIndex) do
+            local old = tileIndex[key]
+            if not old or old.checksum ~= entry.checksum then
+                changed = true
+                break
+            end
+        end
+    end
+    tileIndex = nextIndex
+    if changed then
+        catalogDirty = true
     end
 end
 
@@ -263,16 +297,29 @@ local function rescanDrives(quiet)
                 capacity = state.capacity,
                 meta = state.meta
             }
-            volume.index = loadVolumeIndex(volume)
+            local existing = volumes[volume.id]
+            volume.index = existing and existing.mount == volume.mount
+                and existing.index or loadVolumeIndex(volume)
             state.tileCount = tableCount(volume.index.tiles)
             nextVolumes[volume.id] = volume
+        end
+    end
+
+    local topologyChanged = tableCount(nextVolumes) ~= tableCount(volumes)
+    if not topologyChanged then
+        for volumeId, volume in pairs(nextVolumes) do
+            local previous = volumes[volumeId]
+            if not previous or previous.mount ~= volume.mount then
+                topologyChanged = true
+                break
+            end
         end
     end
 
     drives = nextDrives
     volumes = nextVolumes
     selectedDrive = math.max(1, math.min(selectedDrive, math.max(1, #drives)))
-    rebuildGlobalIndex()
+    if topologyChanged then rebuildGlobalIndex() end
 
     if not quiet then
         log(("Storage scan: %d drive(s), %d volume(s)"):format(
@@ -291,6 +338,38 @@ end
 local function saveVolumeIndex(volume)
     return atlas.writeTable(
         fs.combine(volume.mount, atlas.VOLUME_INDEX), volume.index)
+end
+
+local function markVolumeIndexDirty(volume)
+    if dirtyVolumeIndexes[volume.id] then return true end
+    local ok, failure = atlas.writeAtomic(
+        fs.combine(volume.mount, INDEX_DIRTY_MARKER),
+        tostring(atlas.now()),
+        false)
+    if ok then dirtyVolumeIndexes[volume.id] = true end
+    return ok, failure
+end
+
+local function flushVolumeIndex(volume)
+    if not volume or not dirtyVolumeIndexes[volume.id] then return true end
+    local ok, failure = saveVolumeIndex(volume)
+    if not ok then return false, failure end
+    local dirtyPath = fs.combine(volume.mount, INDEX_DIRTY_MARKER)
+    if fs.exists(dirtyPath) then pcall(fs.delete, dirtyPath) end
+    dirtyVolumeIndexes[volume.id] = nil
+    return true
+end
+
+local function flushDirtyVolumeIndexes()
+    for volumeId in pairs(dirtyVolumeIndexes) do
+        local volume = volumes[volumeId]
+        if volume then
+            local ok, failure = flushVolumeIndex(volume)
+            if not ok then
+                log("Index flush failed: " .. tostring(failure), "ERROR")
+            end
+        end
+    end
 end
 
 local function availableFree(volume)
@@ -327,7 +406,7 @@ local function removeOldEntry(key, oldEntry, keepVolumeId, keepPath)
     if fs.exists(oldPath) then pcall(fs.delete, oldPath) end
 end
 
-local function storeTile(tile, excludedVolumeId, force)
+local function storeTile(tile, excludedVolumeId, force, deferIndexWrite)
     local valid, reason = atlas.validateTile(tile)
     if not valid then return false, reason end
 
@@ -344,6 +423,10 @@ local function storeTile(tile, excludedVolumeId, force)
 
     local volume = chooseVolume(#encoded + 4096, excludedVolumeId)
     if not volume then return false, "no ATLAS volume has enough free space" end
+    if deferIndexWrite then
+        local dirtyOk, dirtyFailure = markVolumeIndexDirty(volume)
+        if not dirtyOk then return false, dirtyFailure end
+    end
 
     local relative = atlas.tileRelativePath(tile)
     local fullPath = fs.combine(volume.mount, relative)
@@ -357,11 +440,18 @@ local function storeTile(tile, excludedVolumeId, force)
         size = #encoded
     }
     volume.index.tiles[key] = entry
-    local indexOk, indexFailure = saveVolumeIndex(volume)
-    if not indexOk then
-        pcall(fs.delete, fullPath)
-        volume.index.tiles[key] = nil
-        return false, indexFailure
+    if not deferIndexWrite then
+        local indexOk, indexFailure = saveVolumeIndex(volume)
+        if not indexOk then
+            pcall(fs.delete, fullPath)
+            volume.index.tiles[key] = nil
+            return false, indexFailure
+        end
+        if dirtyVolumeIndexes[volume.id] then
+            local dirtyPath = fs.combine(volume.mount, INDEX_DIRTY_MARKER)
+            if fs.exists(dirtyPath) then pcall(fs.delete, dirtyPath) end
+            dirtyVolumeIndexes[volume.id] = nil
+        end
     end
 
     local indexed = {
@@ -373,6 +463,9 @@ local function storeTile(tile, excludedVolumeId, force)
     }
     tileIndex[key] = indexed
     removeOldEntry(key, existing, volume.id, relative)
+    if not existing or existing.checksum ~= indexed.checksum then
+        catalogDirty = true
+    end
     return true, "stored", indexed
 end
 
@@ -554,7 +647,16 @@ local function stationInfo()
         aircraft = tableCount(aircraft),
         capabilities = {
             bulkTiles = true,
-            maxBulkTiles = MAX_BULK_REQUEST_TILES
+            maxBulkTiles = MAX_BULK_REQUEST_TILES,
+            bulkUploads = true,
+            maxBulkUploads = MAX_BULK_UPLOAD_TILES,
+            tileWindows = true,
+            maxWindowTiles = MAX_WINDOW_REQUEST_TILES,
+            windowSegmentTiles = WINDOW_SEGMENT_TILES,
+            windowSegmentsInFlight = WINDOW_SEGMENT_CONCURRENCY,
+            catalog = true,
+            catalogPageSize = CATALOG_PAGE_SIZE,
+            catalogRevision = catalogRevision
         }
     }
 end
@@ -587,6 +689,130 @@ local function trafficSnapshot()
         return tostring(a.callsign) < tostring(b.callsign)
     end)
     return snapshot
+end
+
+local function makeTileItem(request)
+    if type(request) ~= "table"
+        or type(request.dimension) ~= "string"
+        or type(request.chunkX) ~= "number"
+        or type(request.chunkZ) ~= "number" then
+        return nil
+    end
+
+    local item = {
+        dimension = request.dimension,
+        chunkX = request.chunkX,
+        chunkZ = request.chunkZ
+    }
+    local tile, reason = loadIndexedTile(
+        request.dimension, request.chunkX, request.chunkZ)
+    if tile then
+        if request.checksum == tile.checksum then
+            item.status = "current"
+        else
+            item.status = "data"
+            item.tile = tile
+            stats.downloads = stats.downloads + 1
+        end
+    else
+        item.status = reason == "missing" and "missing" or "unavailable"
+        item.reason = reason
+    end
+    return item
+end
+
+local function catalogSnapshot()
+    if catalogKeys
+        and (not catalogDirty or atlas.now() - catalogBuiltAt < 5000) then
+        return catalogKeys
+    end
+    local keys = {}
+    for key in pairs(tileIndex) do keys[#keys + 1] = key end
+    table.sort(keys)
+    catalogKeys = keys
+    catalogBuiltAt = atlas.now()
+    if catalogDirty then
+        catalogRevision = catalogRevision + 1
+        catalogDirty = false
+    end
+    return keys
+end
+
+local function catalogPage(cursor, requestedLimit)
+    local keys = catalogSnapshot()
+    cursor = math.max(1, math.floor(tonumber(cursor) or 1))
+    local limit = math.max(
+        1, math.min(CATALOG_PAGE_SIZE, math.floor(tonumber(requestedLimit)
+            or CATALOG_PAGE_SIZE)))
+    local entries = {}
+    local finalIndex = math.min(#keys, cursor + limit - 1)
+    for index = cursor, finalIndex do
+        local key = keys[index]
+        local dimension, chunkX, chunkZ =
+            key:match("^(.-)|(-?%d+)|(-?%d+)$")
+        local indexed = tileIndex[key]
+        if dimension and indexed then
+            entries[#entries + 1] = {
+                dimension = dimension,
+                chunkX = tonumber(chunkX),
+                chunkZ = tonumber(chunkZ),
+                checksum = indexed.checksum
+            }
+        end
+    end
+    return {
+        entries = entries,
+        cursor = cursor,
+        nextCursor = finalIndex < #keys and (finalIndex + 1) or nil,
+        total = #keys,
+        revision = catalogRevision
+    }
+end
+
+local function startWindowTransfer(sender, message)
+    local requests = type(message.tiles) == "table" and message.tiles or {}
+    local count = math.min(#requests, MAX_WINDOW_REQUEST_TILES)
+    local items = {}
+    for index = 1, count do
+        local item = makeTileItem(requests[index])
+        if item then items[#items + 1] = item end
+    end
+
+    local segments = {}
+    for first = 1, #items, WINDOW_SEGMENT_TILES do
+        local segmentItems = {}
+        local final = math.min(#items, first + WINDOW_SEGMENT_TILES - 1)
+        for index = first, final do
+            segmentItems[#segmentItems + 1] = items[index]
+        end
+        segments[#segments + 1] = {
+            items = segmentItems,
+            attempts = 0,
+            sentAt = 0,
+            acknowledged = false
+        }
+    end
+    if #segments == 0 then segments[1] = {
+        items = {},
+        attempts = 0,
+        sentAt = 0,
+        acknowledged = false
+    } end
+
+    local transferKey = tostring(sender) .. "|" .. tostring(message.requestId)
+    windowTransfers[transferKey] = {
+        sender = sender,
+        requestId = message.requestId,
+        segments = segments,
+        createdAt = atlas.now()
+    }
+end
+
+local function acknowledgeWindowSegment(sender, message)
+    local transferKey = tostring(sender) .. "|" .. tostring(message.requestId)
+    local transfer = windowTransfers[transferKey]
+    local segment = transfer and transfer.segments[tonumber(message.segment)]
+    if segment then segment.acknowledged = true end
 end
 
 local function handleMessage(sender, message)
@@ -632,6 +858,51 @@ local function handleMessage(sender, message)
                 log("Upload rejected: " .. tostring(status), "WARN")
             end
         end
+    elseif message.op == "put_tiles" and type(message.tiles) == "table" then
+        local items = {}
+        local count = math.min(#message.tiles, MAX_BULK_UPLOAD_TILES)
+        if not authorised(message) then
+            stats.rejected = stats.rejected + count
+            atlas.reply(sender, message, "tiles_stored", {
+                items = {},
+                reason = "write access denied",
+                status = "denied"
+            })
+        elseif maintenance then
+            atlas.reply(sender, message, "tiles_stored", {
+                items = {},
+                reason = "station is in storage maintenance",
+                status = "deferred"
+            })
+        else
+            for index = 1, count do
+                local tile = message.tiles[index]
+                local item = type(tile) == "table" and {
+                    dimension = tile.dimension,
+                    chunkX = tile.chunkX,
+                    chunkZ = tile.chunkZ
+                } or {}
+                local ok, status = storeTile(tile, nil, false, true)
+                if ok then
+                    item.status = status
+                    if status == "duplicate" then
+                        stats.duplicates = stats.duplicates + 1
+                    else
+                        stats.uploads = stats.uploads + 1
+                    end
+                else
+                    item.status =
+                        status == "no ATLAS volume has enough free space"
+                            and "deferred" or "error"
+                    item.reason = status
+                    if item.status == "error" then
+                        stats.rejected = stats.rejected + 1
+                    end
+                end
+                items[#items + 1] = item
+            end
+            atlas.reply(sender, message, "tiles_stored", { items = items })
+        end
     elseif message.op == "get_tile" then
         local tile, reason = loadIndexedTile(
             message.dimension, message.chunkX, message.chunkZ)
@@ -653,35 +924,19 @@ local function handleMessage(sender, message)
         local items = {}
         local count = math.min(#message.tiles, MAX_BULK_REQUEST_TILES)
         for index = 1, count do
-            local request = message.tiles[index]
-            if type(request) == "table"
-                and type(request.dimension) == "string"
-                and type(request.chunkX) == "number"
-                and type(request.chunkZ) == "number" then
-                local tile, reason = loadIndexedTile(
-                    request.dimension, request.chunkX, request.chunkZ)
-                local item = {
-                    dimension = request.dimension,
-                    chunkX = request.chunkX,
-                    chunkZ = request.chunkZ
-                }
-                if tile then
-                    if request.checksum == tile.checksum then
-                        item.status = "current"
-                    else
-                        item.status = "data"
-                        item.tile = tile
-                        stats.downloads = stats.downloads + 1
-                    end
-                else
-                    item.status = reason == "missing"
-                        and "missing" or "unavailable"
-                    item.reason = reason
-                end
-                items[#items + 1] = item
-            end
+            local item = makeTileItem(message.tiles[index])
+            if item then items[#items + 1] = item end
         end
         atlas.reply(sender, message, "tiles_data", { items = items })
+    elseif message.op == "get_tile_window"
+        and type(message.tiles) == "table"
+        and message.requestId ~= nil then
+        startWindowTransfer(sender, message)
+    elseif message.op == "tiles_segment_ack" then
+        acknowledgeWindowSegment(sender, message)
+    elseif message.op == "get_catalog" then
+        atlas.reply(sender, message, "catalog_page",
+            catalogPage(message.cursor, message.limit))
     elseif message.op == "heartbeat" then
         aircraft[sender] = {
             callsign = message.callsign or ("AC-" .. sender),
@@ -1061,6 +1316,62 @@ local function trafficLoop()
     end
 end
 
+local function processWindowTransfers()
+    local currentTime = atlas.now()
+    for transferKey, transfer in pairs(windowTransfers) do
+        local active = 0
+        local complete = true
+        for _, segment in ipairs(transfer.segments) do
+            if not segment.acknowledged then
+                complete = false
+                if segment.sentAt > 0
+                    and currentTime - segment.sentAt < WINDOW_RETRY_MS then
+                    active = active + 1
+                end
+            end
+        end
+
+        if complete
+            or currentTime - transfer.createdAt > WINDOW_EXPIRE_MS then
+            windowTransfers[transferKey] = nil
+        else
+            for index, segment in ipairs(transfer.segments) do
+                if active >= WINDOW_SEGMENT_CONCURRENCY then break end
+                local ready = not segment.acknowledged
+                    and (segment.sentAt == 0
+                        or currentTime - segment.sentAt >= WINDOW_RETRY_MS)
+                if ready and segment.attempts < WINDOW_MAX_ATTEMPTS then
+                    atlas.send(transfer.sender, "tiles_segment", {
+                        requestId = transfer.requestId,
+                        segment = index,
+                        segments = #transfer.segments,
+                        items = segment.items
+                    })
+                    segment.sentAt = currentTime
+                    segment.attempts = segment.attempts + 1
+                    active = active + 1
+                end
+            end
+        end
+    end
+end
+
+local function transferLoop()
+    local lastIndexFlush = 0
+    while running do
+        processWindowTransfers()
+        if atlas.now() - lastIndexFlush >= INDEX_FLUSH_MS then
+            flushDirtyVolumeIndexes()
+            lastIndexFlush = atlas.now()
+        end
+        local event = atlas.waitSeconds(0.05)
+        if not event then
+            running = false
+            return
+        end
+    end
+end
+
 local function main()
     math.randomseed(atlas.now() + os.getComputerID())
     atlas.writeTable(CONFIG_PATH, config)
@@ -1072,8 +1383,10 @@ local function main()
     else
         log("ATLAS storage online; attach a modem for networking", "WARN")
     end
-    parallel.waitForAny(uiLoop, networkLoop, driveLoop, jobLoop, trafficLoop)
+    parallel.waitForAny(
+        uiLoop, networkLoop, driveLoop, jobLoop, trafficLoop, transferLoop)
     running = false
+    flushDirtyVolumeIndexes()
     if networkHosted then pcall(rednet.unhost, atlas.PROTOCOL_DISCOVERY) end
 end
 

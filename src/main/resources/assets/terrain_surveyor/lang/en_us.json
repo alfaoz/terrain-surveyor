@@ -4,6 +4,6 @@
   "item.terrain_surveyor.layered_terrain_imaging_assembly": "Layered Terrain Imaging Assembly",
   "item.terrain_surveyor.terrain_imaging_core": "Terrain Imaging Core",
   "tooltip.terrain_surveyor.terrain_surveyor.passive": "Passive CC:Tweaked terrain peripheral",
-  "tooltip.terrain_surveyor.terrain_surveyor.resolution": "1-block resolution - 8 chunk radius",
+  "tooltip.terrain_surveyor.terrain_surveyor.resolution": "1-block resolution - 8 chunk radius - native batch scanning",
   "tooltip.terrain_surveyor.terrain_surveyor.layers": "Reports surface and clearance height layers"
 }

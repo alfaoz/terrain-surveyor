@@ -1,7 +1,7 @@
 return {
     name = "atlas-navigator",
-    version = "1.2.0",
-    description = "Shared ATLAS CC:Graphics terrain and waypoint navigator",
+    version = "1.3.0",
+    description = "Shared ATLAS CC:Graphics terrain, cache, and waypoint navigator",
     author = "alfaoz",
 
     base_url = "https://raw.githubusercontent.com/alfaoz/terrain-surveyor/main/atlas",
@@ -13,7 +13,7 @@ return {
     },
 
     hashes = {
-        ["navigator.lua"] = "ae7b9cef33e608700faf1c9dda3f3ac1b20477bf8f83d201b40fa725554f62dc"
+        ["navigator.lua"] = "788d96d6321dd0bb19b88bdafd7219b8222d3ae9ea676109adbbfcf15ce3a04b"
     },
 
     dependencies = { "atlas-core" },

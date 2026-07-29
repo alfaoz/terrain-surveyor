@@ -1,6 +1,6 @@
 return {
     name = "atlas-core",
-    version = "1.0.0",
+    version = "1.1.0",
     description = "Shared protocol and terrain storage library for ATLAS",
     author = "alfaoz",
 
@@ -13,6 +13,6 @@ return {
     },
 
     hashes = {
-        ["lib.lua"] = "f6d70128a7c2ade3ed80068b3d2f65c0fe4d78986698fad040a4b6874a6e9c48"
+        ["lib.lua"] = "a6bc46757c8ec817570e27e4609675d1a123d48cbe1935ccc45ae5eb42f17a4d"
     }
 }

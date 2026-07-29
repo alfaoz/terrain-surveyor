@@ -62,6 +62,7 @@ local available = {}
 for _, method in ipairs(methods) do available[method] = true end
 check(available.getInfo, "getInfo() is exposed")
 check(available.scanChunk, "scanChunk() is exposed")
+check(available.scanBatch, "scanBatch() is exposed")
 
 local infoOk, info = pcall(surveyor.getInfo)
 check(infoOk, "getInfo() completed")
@@ -77,6 +78,8 @@ print(("  Dimension: %s"):format(info.dimension))
 print(("  XYZ: %.2f, %.2f, %.2f"):format(info.x, info.y, info.z))
 print(("  Chunk: %d, %d"):format(info.chunkX, info.chunkZ))
 print(("  Radius: +/- %d chunks"):format(info.maxChunkRadius))
+print(("  Native batch: up to %d chunks, %d requests, %dus budget"):format(
+    info.maxBatchChunks, info.maxBatchRequests, info.maxScanBudgetMicros))
 
 local rangeOk, rangeError = pcall(surveyor.scanChunk, info.maxChunkRadius + 1, 0)
 check(not rangeOk, "out-of-range request was rejected")
@@ -105,6 +108,20 @@ local repeatOk, repeatedTile = pcall(surveyor.scanChunk, dx, dz)
 check(repeatOk, "immediate repeat scan completed without a cooldown")
 check(repeatedTile.checksum == tile.checksum,
     "repeat scan returned the same terrain checksum")
+
+local batchOk, batch = pcall(surveyor.scanBatch, {
+    { chunkX = info.chunkX, chunkZ = info.chunkZ },
+    { chunkX = info.chunkX + 1, chunkZ = info.chunkZ },
+    { chunkX = info.chunkX, chunkZ = info.chunkZ + 1 }
+}, 3, info.maxScanBudgetMicros)
+check(batchOk, "native batch scan completed")
+check(type(batch.tiles) == "table"
+    and type(batch.unloaded) == "table"
+    and type(batch.deferred) == "table",
+    "batch result separated scanned, unloaded, and deferred chunks")
+check(#batch.tiles >= 1, "batch included the current loaded chunk")
+print(("  Batch: %d scanned, %d unloaded, %d deferred in %dus"):format(
+    #batch.tiles, #batch.unloaded, #batch.deferred, batch.elapsedMicros))
 
 local minimumSurface
 local maximumSurface

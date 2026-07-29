@@ -1,5 +1,5 @@
 -- ATLAS Navigator for:
---   Terrain Surveyor 0.1.4
+--   Terrain Surveyor 0.2.0
 --   CC: Tweaked 1.120.0
 --   CC: Graphics 0.2.0
 --
@@ -10,8 +10,12 @@ local atlas = dofile(LIBRARY)
 
 -- One Minecraft tick: 20 visual/position updates per second.
 local UPDATE_SECONDS = 0.05
-local SCANS_PER_POLL = 4
 local RETRY_MS = 1500
+local UNLOADED_RETRY_MS = 250
+local DEFAULT_SCAN_BATCH_CHUNKS = 8
+local DEFAULT_SCAN_BUDGET_MICROS = 4000
+local SCAN_PREFETCH_TARGET = 96
+local CACHE_WRITES_PER_TICK = 6
 local NETWORK_TICK_SECONDS = 0.05
 local HEARTBEAT_MS = 1000
 local TRAFFIC_MS = 1000
@@ -20,6 +24,15 @@ local NETWORK_TIMEOUT_MS = 3000
 local NETWORK_MISS_MS = 30000
 local CACHE_META_PATH = "/atlas/cache/index.dat"
 local CACHE_TILE_ROOT = "/atlas/cache/tiles"
+local CACHE_POLICY = {
+    volumeMeta = "atlas/air_cache.dat",
+    volumeFormat = 1,
+    rescanMs = 2000,
+    reserveFraction = 0.02,
+    evictionCooldownMs = 60000,
+    localRadiusChunks = 24,
+    forwardMaxChunks = 64
+}
 local NAV_CONFIG_PATH = "/atlas/navigator.cfg"
 local ROUTE_PATH = "/atlas/route.dat"
 local MAP_BUILD_ROWS_PER_YIELD = 12
@@ -33,6 +46,13 @@ local VIEWPORT_INSPECTIONS_PER_REFRESH = 512
 -- recommended response budget, with three requests in flight.
 local DOWNLOAD_BATCH_SIZE = 14
 local MAX_IN_FLIGHT_DOWNLOADS = 3
+local DOWNLOAD_WINDOW_SIZE = 98
+local CATALOG_POLICY = {
+    pageSize = 256,
+    restartMs = 5000,
+    pageDelayMs = 100,
+    downloadPriority = 10000
+}
 local HEADER_HEIGHT = 15
 local FOOTER_HEIGHT = 22
 local CONTOUR_INTERVAL = 10
@@ -271,6 +291,11 @@ end
 navConfig.writeKey = navConfig.writeKey or ""
 navConfig.lastServer = navConfig.lastServer or ""
 navConfig.headingOffset = tonumber(navConfig.headingOffset) or 0
+navConfig.scanBatchChunks = clamp(
+    tonumber(navConfig.scanBatchChunks) or DEFAULT_SCAN_BATCH_CHUNKS, 1, 16)
+navConfig.scanBudgetMicros = clamp(
+    tonumber(navConfig.scanBudgetMicros) or DEFAULT_SCAN_BUDGET_MICROS,
+    500, 8000)
 
 local routeData = atlas.readTable(ROUTE_PATH) or {}
 local waypoints = type(routeData.waypoints) == "table"
@@ -311,6 +336,15 @@ local pendingNetwork = {}
 local pendingKeys = {}
 local uploadQueue = {}
 local uploadRetry = {}
+local cacheWriteQueue = {}
+local cacheVolumes = {}
+local cacheStorage = {
+    volumes = 1,
+    capacity = 0,
+    free = 0
+}
+local lastCacheVolumeScan = 0
+local cacheEvictedUntil = {}
 local downloadQueue = {}
 local networkMissUntil = {}
 local serverVerifiedAt = {}
@@ -329,6 +363,26 @@ local modal = false
 local lastDisplayMap
 local pointerDetails
 local viewportPrefetchState
+local catalogState = {
+    revision = nil,
+    cursor = 1,
+    total = 0,
+    seen = 0,
+    mirrored = 0,
+    pending = false,
+    nextAt = 0
+}
+local scanMetrics = {
+    completedAt = {},
+    chunksPerSecond = 0,
+    backlog = 0,
+    waiting = 0,
+    aheadChunks = 0,
+    aheadSeconds = 0,
+    lastBatchChunks = 0,
+    lastBatchMicros = 0,
+    batchSupported = false
+}
 
 local function saveRoute()
     activeWaypoint = math.max(1, math.min(
@@ -434,14 +488,142 @@ local function calibrateHeading()
     scanStatus = ("HEADING CAL %+.1f"):format(navConfig.headingOffset)
 end
 
-local function localCachePath(dimension, chunkX, chunkZ)
+local function cacheRelativePath(dimension, chunkX, chunkZ)
     local regionX = math.floor(chunkX / 32)
     local regionZ = math.floor(chunkZ / 32)
     return fs.combine(
-        CACHE_TILE_ROOT,
+        "atlas/cache/tiles",
         atlas.safeName(dimension),
         regionX .. "_" .. regionZ,
         chunkX .. "_" .. chunkZ .. ".tile")
+end
+
+local function localCachePath(dimension, chunkX, chunkZ)
+    return "/" .. cacheRelativePath(dimension, chunkX, chunkZ)
+end
+
+local function cacheVolumeById(identifier)
+    for _, volume in ipairs(cacheVolumes) do
+        if volume.id == identifier then return volume end
+    end
+end
+
+local function cacheEntryPath(entry)
+    if not entry then return nil end
+    if entry.volumeId and entry.relativePath then
+        local volume = cacheVolumeById(entry.volumeId)
+        if not volume then return nil end
+        return fs.combine(volume.mount, entry.relativePath)
+    end
+    return entry.path
+end
+
+local function refreshCacheVolumes(force)
+    local currentTime = nowMs()
+    if not force
+        and currentTime - lastCacheVolumeScan
+            < CACHE_POLICY.rescanMs then return end
+    lastCacheVolumeScan = currentTime
+
+    local nextVolumes = {
+        {
+            id = "computer",
+            label = "ONBOARD COMPUTER",
+            mount = "/",
+            removable = false
+        }
+    }
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(name, "drive") then
+            local drive = peripheral.wrap(name)
+            local okMount, mount = pcall(drive.getMountPath)
+            if okMount and type(mount) == "string" and fs.exists(mount) then
+                local metaPath = fs.combine(mount, CACHE_POLICY.volumeMeta)
+                local meta = atlas.readTable(metaPath)
+                if type(meta) ~= "table" then
+                    local okList, entries = pcall(fs.list, mount)
+                    if okList and #entries == 0 then
+                        meta = {
+                            atlas = atlas.VERSION,
+                            format = CACHE_POLICY.volumeFormat,
+                            id = atlas.randomId("air-cache"),
+                            label = "ATLAS AIR CACHE",
+                            createdAt = atlas.now()
+                        }
+                        atlas.writeTable(metaPath, meta)
+                        pcall(drive.setDiskLabel, "ATLAS AIR CACHE")
+                    end
+                end
+                if type(meta) == "table"
+                    and meta.atlas == atlas.VERSION
+                    and meta.format == CACHE_POLICY.volumeFormat
+                    and type(meta.id) == "string" then
+                    nextVolumes[#nextVolumes + 1] = {
+                        id = meta.id,
+                        label = meta.label or "ATLAS AIR CACHE",
+                        mount = mount,
+                        drive = name,
+                        removable = true
+                    }
+                end
+            end
+        end
+    end
+    cacheVolumes = nextVolumes
+
+    local capacity = 0
+    local free = 0
+    for _, volume in ipairs(cacheVolumes) do
+        local details = atlas.capacity(volume.mount)
+        if type(details.capacity) == "number" then
+            capacity = capacity + details.capacity
+        end
+        if type(details.free) == "number" then
+            free = free + details.free
+        end
+    end
+    cacheStorage.volumes = #cacheVolumes
+    cacheStorage.capacity = capacity
+    cacheStorage.free = free
+end
+
+local function chooseCacheVolume(requiredBytes, previous)
+    refreshCacheVolumes(false)
+    local preferred = previous and cacheVolumeById(previous.volumeId)
+    if preferred then
+        local details = atlas.capacity(preferred.mount)
+        local reserve = type(details.capacity) == "number"
+            and details.capacity * CACHE_POLICY.reserveFraction or 0
+        local reclaimable = tonumber(previous.size) or 0
+        if details.free == "unlimited"
+            or type(details.free) == "number"
+                and details.free + reclaimable - reserve >= requiredBytes then
+            return preferred
+        end
+    end
+
+    local choice
+    local bestAvailable = -math.huge
+    for _, volume in ipairs(cacheVolumes) do
+        local details = atlas.capacity(volume.mount)
+        local available
+        if details.free == "unlimited" then
+            available = math.huge
+        elseif type(details.free) == "number" then
+            local reserve = type(details.capacity) == "number"
+                and details.capacity * CACHE_POLICY.reserveFraction or 0
+            available = details.free - reserve
+        end
+        if available and available >= requiredBytes then
+            local score = available
+            if volume.removable and score < math.huge then score = score + 1 end
+            if score > bestAvailable then
+                choice = volume
+                bestAvailable = score
+            end
+        end
+    end
+    return choice
 end
 
 local cacheDirty = false
@@ -449,34 +631,64 @@ local cacheDirty = false
 local function saveLocalRaw(raw, unsynced)
     local encoded, reason = atlas.encodeTile(raw)
     if not encoded then return false, reason end
-    local path = localCachePath(raw.dimension, raw.chunkX, raw.chunkZ)
+    local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
+    local previous = cacheIndex.tiles[key]
+    local volume = chooseCacheVolume(#encoded + 512, previous)
+    if not volume then return false, "onboard cache is full" end
+    local relativePath = cacheRelativePath(
+        raw.dimension, raw.chunkX, raw.chunkZ)
+    local path = fs.combine(volume.mount, relativePath)
     local ok, failure = atlas.writeAtomic(path, encoded, false)
     if not ok then return false, failure end
 
-    local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
-    local previous = cacheIndex.tiles[key]
     cacheIndex.tiles[key] = {
         path = path,
+        volumeId = volume.id,
+        relativePath = relativePath,
         checksum = raw.checksum,
         lastUsed = nowMs(),
-        unsynced = unsynced
-            or (previous and previous.unsynced)
-            or false,
+        unsynced = unsynced == nil
+            and (previous and previous.unsynced or false)
+            or unsynced,
         size = #encoded
     }
+    local oldPath = cacheEntryPath(previous)
+    if oldPath and oldPath ~= path and fs.exists(oldPath) then
+        pcall(fs.delete, oldPath)
+    end
     cacheDirty = true
     return true
+end
+
+local function queueLocalSave(raw, unsynced, background)
+    local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
+    local pending = cacheWriteQueue[key]
+    cacheWriteQueue[key] = {
+        raw = atlas.copyTile(raw),
+        unsynced = unsynced
+            or (pending and pending.unsynced)
+            or false,
+        background = background == true
+            and (not pending or pending.background ~= false),
+        attempts = pending and pending.attempts or 0,
+        notBefore = pending and pending.notBefore or 0
+    }
 end
 
 local function loadLocalRaw(dimension, chunkX, chunkZ)
     local key = tileKey(dimension, chunkX, chunkZ)
     local entry = cacheIndex.tiles[key]
-    local path = entry and entry.path
+    local path = cacheEntryPath(entry)
         or localCachePath(dimension, chunkX, chunkZ)
     if not fs.exists(path) then
         if entry then
-            cacheIndex.tiles[key] = nil
-            cacheDirty = true
+            local volumeMissing = entry.volumeId
+                and entry.volumeId ~= "computer"
+                and not cacheVolumeById(entry.volumeId)
+            if not volumeMissing then
+                cacheIndex.tiles[key] = nil
+                cacheDirty = true
+            end
         end
         return nil
     end
@@ -488,6 +700,8 @@ local function loadLocalRaw(dimension, chunkX, chunkZ)
     end
     cacheIndex.tiles[key] = entry or {
         path = path,
+        volumeId = "computer",
+        relativePath = cacheRelativePath(dimension, chunkX, chunkZ),
         checksum = raw.checksum,
         unsynced = false,
         size = fs.getSize(path)
@@ -505,6 +719,8 @@ local function queueUpload(raw)
         entry.unsynced = true
         cacheDirty = true
     end
+    local pendingWrite = cacheWriteQueue[key]
+    if pendingWrite then pendingWrite.unsynced = true end
     local retry = uploadRetry[key]
     if retry and retry.checksum ~= raw.checksum then uploadRetry[key] = nil end
 end
@@ -516,6 +732,11 @@ local function markSynced(raw)
         entry.unsynced = false
         cacheDirty = true
     end
+    local pendingWrite = cacheWriteQueue[key]
+    if pendingWrite and pendingWrite.raw.checksum == raw.checksum then
+        pendingWrite.unsynced = false
+        pendingWrite.background = false
+    end
     uploadQueue[key] = nil
     uploadRetry[key] = nil
     networkMissUntil[key] = nil
@@ -523,15 +744,27 @@ local function markSynced(raw)
 end
 
 local function queueDownload(
-        dimension, chunkX, chunkZ, priority, verifyExisting)
+        dimension, chunkX, chunkZ, priority, verifyExisting, cacheOnly)
     if not serverId then return false end
     local key = tileKey(dimension, chunkX, chunkZ)
-    if pendingKeys[key] then return false end
+    if pendingKeys[key] then
+        local pendingRequest = downloadQueue[key]
+        if pendingRequest and not cacheOnly then
+            pendingRequest.cacheOnly = false
+        end
+        return false
+    end
     local cached = cacheIndex.tiles[key]
-    local hasCached = cached and fs.exists(cached.path)
+    if cached and verifyExisting and not cached.unsynced
+        and serverVerifiedAt[key] then return false end
+    local cachedPath = cacheEntryPath(cached)
+    local hasCached = cachedPath and fs.exists(cachedPath)
     local localTile = tiles[key]
     local knownChecksum = localTile and localTile.checksum
         or hasCached and cached.checksum
+    if localTile and not hasCached and not cacheWriteQueue[key] then
+        queueLocalSave(localTile.raw, uploadQueue[key] ~= nil)
+    end
 
     if localTile or hasCached then
         if not verifyExisting or cached and cached.unsynced
@@ -543,17 +776,29 @@ local function queueDownload(
     local existing = downloadQueue[key]
     if not existing or priority < existing.priority then
         if not existing and tableCount(downloadQueue) >= MAX_DOWNLOAD_QUEUE then
-            return false
+            local worstKey
+            local worstPriority = -math.huge
+            for queuedKey, queued in pairs(downloadQueue) do
+                if not pendingKeys[queuedKey]
+                    and queued.priority > worstPriority then
+                    worstKey = queuedKey
+                    worstPriority = queued.priority
+                end
+            end
+            if not worstKey or priority >= worstPriority then return false end
+            downloadQueue[worstKey] = nil
         end
         downloadQueue[key] = {
             dimension = dimension,
             chunkX = chunkX,
             chunkZ = chunkZ,
             priority = priority,
-            knownChecksum = knownChecksum
+            knownChecksum = knownChecksum,
+            cacheOnly = cacheOnly == true
         }
         return not existing
     end
+    if existing and not cacheOnly then existing.cacheOnly = false end
     return false
 end
 
@@ -809,9 +1054,16 @@ local function installRawTile(raw, source)
     local key = tileKey(decoded.dimension, decoded.chunkX, decoded.chunkZ)
     local previous = tiles[key]
     local cached = cacheIndex.tiles[key]
-    if source == "network" and cached and cached.unsynced
-        and cached.checksum ~= decoded.checksum then
-        return previous
+    local pendingWrite = cacheWriteQueue[key]
+    if source == "network" then
+        if cached and cached.unsynced
+            and cached.checksum ~= decoded.checksum then
+            return previous
+        end
+        if pendingWrite and pendingWrite.unsynced
+            and pendingWrite.raw.checksum ~= decoded.checksum then
+            return previous
+        end
     end
     tiles[key] = decoded
     retryAfter[key] = nil
@@ -822,17 +1074,24 @@ local function installRawTile(raw, source)
 
     if source == "survey" then
         forceSurvey[key] = nil
-        saveLocalRaw(raw, true)
+        queueLocalSave(raw, true)
         queueUpload(raw)
     elseif source == "network" then
-        saveLocalRaw(raw, false)
+        queueLocalSave(raw, false)
     end
     return decoded
 end
 
 local function loadCachedTileIfPresent(dimension, chunkX, chunkZ)
     local key = tileKey(dimension, chunkX, chunkZ)
-    if tiles[key] then return false end
+    if tiles[key] then
+        local entry = cacheIndex.tiles[key]
+        local path = cacheEntryPath(entry)
+        if (not path or not fs.exists(path)) and not cacheWriteQueue[key] then
+            queueLocalSave(tiles[key].raw, uploadQueue[key] ~= nil)
+        end
+        return false
+    end
     local raw = loadLocalRaw(dimension, chunkX, chunkZ)
     if not raw then return false end
     installRawTile(raw, "disk")
@@ -854,6 +1113,9 @@ end
 local function rebuildScanPlan(infoValue)
     local directionX, directionZ = scanDirection()
     local radius = infoValue.maxChunkRadius
+    local highSpeed = motion.speed >= 8
+    local horizonChunks = clamp(
+        math.ceil((motion.speed * 8 + 32) / 16), 3, radius)
     local waypoint = nextWaypoint()
     local waypointChunkX = waypoint and math.floor(waypoint.x / 16)
     local waypointChunkZ = waypoint and math.floor(waypoint.z / 16)
@@ -865,14 +1127,23 @@ local function rebuildScanPlan(infoValue)
             if distanceSquared <= radius * radius then
                 local distance = math.sqrt(distanceSquared)
                 local score = distance * 100
-                if distance <= 2.25 then score = score - 10000 end
+                local forward = dx * directionX + dz * directionZ
+                local cross = math.abs(dx * directionZ - dz * directionX)
+                local corridorWidth = 1.25 + math.max(0, forward) * 0.28
+
+                if distance <= 1.5 then score = score - 20000 end
 
                 if distance > 0 then
-                    local forward = dx * directionX + dz * directionZ
-                    local cross = math.abs(dx * directionZ - dz * directionX)
-                    local coneWidth = 1.5 + math.max(0, forward) * 0.55
-                    if forward > 0 and cross <= coneWidth then
-                        score = score - 6000 - forward * 120
+                    if forward > 0 and cross <= corridorWidth then
+                        score = score - (highSpeed and 16000 or 7000)
+                        score = score - forward * (highSpeed and 420 or 140)
+                        score = score + cross * 300
+                        if forward <= horizonChunks then
+                            score = score - 1200
+                        end
+                    elseif highSpeed then
+                        score = score + 8000
+                        if forward < -1 then score = score + 10000 end
                     end
                 end
 
@@ -888,7 +1159,9 @@ local function rebuildScanPlan(infoValue)
                     dx = dx,
                     dz = dz,
                     distance = distanceSquared,
-                    score = score
+                    score = score,
+                    forward = forward,
+                    cross = cross
                 }
             end
         end
@@ -900,14 +1173,16 @@ local function rebuildScanPlan(infoValue)
     scanOffsets = offsets
 end
 
-local function chooseScan(infoValue)
+local function prepareScanPlan(infoValue)
     local waypoint = nextWaypoint()
     local direction = math.floor((motion.track or 0) / 15)
+    local speedBand = math.floor((motion.speed or 0) / 4)
     local signature = table.concat({
         infoValue.chunkX,
         infoValue.chunkZ,
         infoValue.maxChunkRadius,
         direction,
+        speedBand,
         activeWaypoint,
         waypoint and math.floor(waypoint.x / 16) or "",
         waypoint and math.floor(waypoint.z / 16) or ""
@@ -918,9 +1193,17 @@ local function chooseScan(infoValue)
         scanPlanSignature = signature
         rebuildScanPlan(infoValue)
     end
+end
 
+local function chooseScanBatch(infoValue, maximum)
+    prepareScanPlan(infoValue)
     local currentTime = nowMs()
     local waitingForSharedMap = false
+    local selected = {}
+    local selectedKeys = {}
+    local waitingCount = 0
+    local backlog = 0
+    local sharedQueued = 0
 
     for _, offset in ipairs(scanOffsets) do
         local chunkX = infoValue.chunkX + offset.dx
@@ -939,49 +1222,209 @@ local function chooseScan(infoValue)
         end
 
         if not tile and currentTime >= retryTime then
-            if forced then return offset, key end
-
             local stationConfirmedMissing =
                 currentTime < (networkMissUntil[key] or 0)
-            if serverId and linkStatus ~= "LOST"
+            if forced or stationConfirmedMissing
+                or not serverId or linkStatus == "LOST" then
+                backlog = backlog + 1
+                if #selected < maximum then
+                    selected[#selected + 1] = {
+                        dx = offset.dx,
+                        dz = offset.dz,
+                        chunkX = chunkX,
+                        chunkZ = chunkZ,
+                        score = offset.score
+                    }
+                    selectedKeys[key] = true
+                end
+            elseif serverId and linkStatus ~= "LOST"
                 and not stationConfirmedMissing then
-                queueDownload(
-                    infoValue.dimension, chunkX, chunkZ,
-                    -10000 + offset.score)
+                if sharedQueued < SCAN_PREFETCH_TARGET then
+                    queueDownload(
+                        infoValue.dimension, chunkX, chunkZ,
+                        -10000 + offset.score)
+                    sharedQueued = sharedQueued + 1
+                end
                 waitingForSharedMap = true
-            else
-                return offset, key
+                waitingCount = waitingCount + 1
             end
         end
     end
 
-    return nil, nil, waitingForSharedMap
+    scanMetrics.backlog = backlog
+    scanMetrics.waiting = waitingCount
+    return selected, selectedKeys, waitingForSharedMap
 end
 
-local function scanOne(infoValue)
+local function recordCompletedScans(count)
+    local timestamp = nowMs()
+    for _ = 1, count do
+        scanMetrics.completedAt[#scanMetrics.completedAt + 1] = timestamp
+    end
+end
+
+local function updateScanTelemetry(infoValue)
+    local currentTime = nowMs()
+    while scanMetrics.completedAt[1]
+        and currentTime - scanMetrics.completedAt[1]
+            > 5000 do
+        table.remove(scanMetrics.completedAt, 1)
+    end
+    scanMetrics.chunksPerSecond =
+        #scanMetrics.completedAt / 5
+
+    local directionX, directionZ = scanDirection()
+    local ahead = 0
+    for step = 1, infoValue.maxChunkRadius do
+        local chunkX = math.floor(
+            infoValue.chunkX + directionX * step + 0.5)
+        local chunkZ = math.floor(
+            infoValue.chunkZ + directionZ * step + 0.5)
+        if tiles[tileKey(infoValue.dimension, chunkX, chunkZ)] then
+            ahead = step
+        else
+            break
+        end
+    end
+    scanMetrics.aheadChunks = ahead
+    scanMetrics.aheadSeconds = motion.speed > 0.5
+        and ahead * 16 / motion.speed or 0
+end
+
+local function scanLegacy(infoValue)
+    for _ = 1, 4 do
+        local selected, _, waitingForSharedMap =
+            chooseScanBatch(infoValue, 1)
+        local offset = selected[1]
+        if not offset then
+            scanStatus = waitingForSharedMap
+                and "SYNCING SHARED MAP" or "CURRENT"
+            return
+        end
+
+        scanStatus = ("SCAN %d %d"):format(offset.dx, offset.dz)
+        local key = tileKey(
+            infoValue.dimension, offset.chunkX, offset.chunkZ)
+        local ok, rawOrError = pcall(
+            surveyor.scanChunk, offset.dx, offset.dz)
+        if not ok then
+            retryAfter[key] = nowMs() + RETRY_MS
+            scanStatus = "WAITING"
+            return
+        end
+        installRawTile(rawOrError, "survey")
+        recordCompletedScans(1)
+    end
+    scanStatus = "LEGACY SCAN"
+end
+
+local function markBatchOffsetsForRetry(
+        entries, originChunkX, originChunkZ, delay)
+    if type(entries) ~= "table" then return end
+    for _, offset in ipairs(entries) do
+        if type(offset) == "table"
+            and type(offset.dx) == "number"
+            and type(offset.dz) == "number" then
+            local chunkX = tonumber(offset.chunkX)
+                or originChunkX + offset.dx
+            local chunkZ = tonumber(offset.chunkZ)
+                or originChunkZ + offset.dz
+            local key = tileKey(
+                info.dimension,
+                chunkX,
+                chunkZ)
+            retryAfter[key] = nowMs() + delay
+        end
+    end
+end
+
+local function scanAvailable(infoValue)
     if infoValue.ready == false then
         scanStatus = "SCANNER BUSY"
-        return false
+        return
     end
 
-    local offset, key, waitingForSharedMap = chooseScan(infoValue)
-    if not offset then
+    local supportsBatch = infoValue.supportsBatch
+        and type(surveyor.scanBatch) == "function"
+    scanMetrics.batchSupported = supportsBatch
+    if not supportsBatch then
+        scanLegacy(infoValue)
+        updateScanTelemetry(infoValue)
+        return
+    end
+
+    local maximum = clamp(
+        navConfig.scanBatchChunks,
+        1,
+        tonumber(infoValue.maxBatchChunks) or 16)
+    if motion.speed >= 8 then
+        maximum = tonumber(infoValue.maxBatchChunks) or 16
+    elseif motion.speed >= 4 then
+        maximum = math.max(maximum, math.min(
+            12, tonumber(infoValue.maxBatchChunks) or 16))
+    end
+    local selected, selectedKeys, waitingForSharedMap =
+        chooseScanBatch(infoValue, maximum)
+    if #selected == 0 then
         scanStatus = waitingForSharedMap
             and "SYNCING SHARED MAP" or "CURRENT"
-        return false
+        updateScanTelemetry(infoValue)
+        return
     end
 
-    scanStatus = ("SCAN %d %d"):format(offset.dx, offset.dz)
-    local ok, rawOrError = pcall(surveyor.scanChunk, offset.dx, offset.dz)
-    if not ok then
-        retryAfter[key] = nowMs() + RETRY_MS
-        scanStatus = "WAITING"
-        return false
+    scanStatus = ("BATCH %d"):format(#selected)
+    local requests = {}
+    for _, offset in ipairs(selected) do
+        requests[#requests + 1] = {
+            dx = offset.dx,
+            dz = offset.dz,
+            chunkX = offset.chunkX,
+            chunkZ = offset.chunkZ
+        }
     end
 
-    installRawTile(rawOrError, "survey")
-    scanStatus = "RECEIVED"
-    return true
+    local ok, result = pcall(
+        surveyor.scanBatch,
+        requests,
+        maximum,
+        motion.speed >= 8
+            and (tonumber(infoValue.maxScanBudgetMicros) or 8000)
+            or navConfig.scanBudgetMicros)
+    if not ok or type(result) ~= "table" then
+        for _, offset in ipairs(selected) do
+            local key = tileKey(
+                infoValue.dimension, offset.chunkX, offset.chunkZ)
+            retryAfter[key] = nowMs() + RETRY_MS
+        end
+        scanStatus = "BATCH ERROR"
+        updateScanTelemetry(infoValue)
+        return
+    end
+
+    local completed = 0
+    for _, raw in ipairs(type(result.tiles) == "table"
+        and result.tiles or {}) do
+        local key = type(raw) == "table"
+            and tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
+        if key and selectedKeys[key] then
+            local installed = pcall(installRawTile, raw, "survey")
+            if installed then completed = completed + 1 end
+        end
+    end
+
+    local originChunkX = tonumber(result.chunkX) or infoValue.chunkX
+    local originChunkZ = tonumber(result.chunkZ) or infoValue.chunkZ
+    markBatchOffsetsForRetry(
+        result.unloaded, originChunkX, originChunkZ, UNLOADED_RETRY_MS)
+    scanMetrics.lastBatchChunks = completed
+    scanMetrics.lastBatchMicros = tonumber(result.elapsedMicros) or 0
+    recordCompletedScans(completed)
+    scanStatus = completed > 0
+        and ("BATCH +%d"):format(completed)
+        or type(result.unloaded) == "table" and #result.unloaded > 0
+            and "WAITING FOR CHUNKS"
+        or "BUDGET WAIT"
+    updateScanTelemetry(infoValue)
 end
 
 local function tileSampleColor(tile, eastTile, southTile, localX, localZ)
@@ -1427,11 +1870,17 @@ local function render()
         width, height)
     local stationTiles = serverInfo and serverInfo.tiles or "?"
     local status = (
-        "LOCAL:%d SERVER:%s UP:%d DOWN:%d RETRY:%d NET:%s POLL:%dX"):format(
-        tileCount, tostring(stationTiles),
+        "CACHE:%d/%s V:%d FREE:%s UP:%d DOWN:%d WRITE:%d NET:%s"):format(
+        tableCount(cacheIndex.tiles), tostring(stationTiles),
+        cacheStorage.volumes, atlas.formatBytes(cacheStorage.free),
         tableCount(uploadQueue), tableCount(downloadQueue),
-        tableCount(uploadRetry), linkStatus, SCANS_PER_POLL)
-    local scannerStatus = "SENSOR " .. scanStatus
+        tableCount(cacheWriteQueue), linkStatus)
+    local scannerStatus = (
+        "SCAN %.1f/S Q:%d AHEAD:%.1fs %s"):format(
+        scanMetrics.chunksPerSecond,
+        scanMetrics.backlog + scanMetrics.waiting,
+        scanMetrics.aheadSeconds,
+        scanStatus)
     local scannerX = math.max(2, width - #scannerStatus * 4 - 1)
     drawText(2, footerY + 7,
         fitText(status, scannerX - 4), COLOR.textDim, width, height)
@@ -1544,9 +1993,7 @@ local function refreshInfo()
         end
     end
 
-    for _ = 1, SCANS_PER_POLL do
-        if not scanOne(info) then break end
-    end
+    scanAvailable(info)
     return true
 end
 
@@ -1566,6 +2013,101 @@ local function sendPending(operation, payload, pending)
         end
     end
     return true
+end
+
+local function processCatalogMirror()
+    if not serverId or linkStatus == "LOST" or catalogState.pending then return end
+    local capabilities = serverInfo
+        and type(serverInfo.capabilities) == "table"
+        and serverInfo.capabilities or {}
+    if not capabilities.catalog or nowMs() < catalogState.nextAt then return end
+    if tableCount(downloadQueue)
+        > MAX_DOWNLOAD_QUEUE - CATALOG_POLICY.pageSize then
+        return
+    end
+
+    local sent = sendPending("get_catalog", {
+        cursor = catalogState.cursor,
+        limit = math.min(
+            CATALOG_POLICY.pageSize,
+            tonumber(capabilities.catalogPageSize) or CATALOG_POLICY.pageSize)
+    }, {
+        type = "catalog"
+    })
+    if sent then catalogState.pending = true end
+end
+
+local function acceptCatalogPage(message)
+    catalogState.pending = false
+    if type(message.entries) ~= "table"
+        or type(message.revision) ~= "number" then
+        catalogState.nextAt = nowMs() + 1000
+        return
+    end
+
+    if catalogState.revision ~= message.revision then
+        catalogState.revision = message.revision
+    end
+    if catalogState.cursor == 1 then
+        catalogState.seen = 0
+        catalogState.mirrored = 0
+    end
+
+    local currentTime = nowMs()
+    for _, catalogEntry in ipairs(message.entries) do
+        if type(catalogEntry) == "table"
+            and type(catalogEntry.dimension) == "string"
+            and type(catalogEntry.chunkX) == "number"
+            and type(catalogEntry.chunkZ) == "number"
+            and type(catalogEntry.checksum) == "string" then
+            local key = tileKey(
+                catalogEntry.dimension,
+                catalogEntry.chunkX,
+                catalogEntry.chunkZ)
+            catalogState.seen = catalogState.seen + 1
+            local cached = cacheIndex.tiles[key]
+            local path = cacheEntryPath(cached)
+            local pendingWrite = cacheWriteQueue[key]
+            local localChecksum = cached and path and fs.exists(path)
+                and cached.checksum
+                or pendingWrite and pendingWrite.raw.checksum
+                or tiles[key] and tiles[key].checksum
+            if localChecksum == catalogEntry.checksum then
+                serverVerifiedAt[key] = currentTime
+                catalogState.mirrored = catalogState.mirrored + 1
+                if cached and cached.unsynced then cached.unsynced = false end
+                if pendingWrite then pendingWrite.unsynced = false end
+                uploadQueue[key] = nil
+                uploadRetry[key] = nil
+                cacheDirty = true
+            elseif currentTime >= (cacheEvictedUntil[key] or 0) then
+                local distancePriority = 0
+                if info and info.dimension == catalogEntry.dimension then
+                    local dx = catalogEntry.chunkX - math.floor(info.x / 16)
+                    local dz = catalogEntry.chunkZ - math.floor(info.z / 16)
+                    distancePriority = math.floor(math.sqrt(dx * dx + dz * dz))
+                else
+                    distancePriority = 1000
+                end
+                queueDownload(
+                    catalogEntry.dimension,
+                    catalogEntry.chunkX,
+                    catalogEntry.chunkZ,
+                    CATALOG_POLICY.downloadPriority + distancePriority,
+                    true,
+                    true)
+            end
+        end
+    end
+
+    catalogState.total = tonumber(message.total) or catalogState.total
+    if type(message.nextCursor) == "number" then
+        catalogState.cursor = message.nextCursor
+        catalogState.nextAt = currentTime + CATALOG_POLICY.pageDelayMs
+    else
+        catalogState.cursor = 1
+        catalogState.nextAt = currentTime + CATALOG_POLICY.restartMs
+    end
 end
 
 local function scheduleUploadRetry(request, reason)
@@ -1617,32 +2159,115 @@ end
 local function processNetworkQueue()
     if not serverId or linkStatus == "LOST" then return end
 
-    for key, raw in pairs(uploadQueue) do
-        local retry = uploadRetry[key]
-        if not pendingKeys[key]
-            and (not retry or nowMs() >= retry.after) then
-            sendPending("offer_tile", {
-                dimension = raw.dimension,
-                chunkX = raw.chunkX,
-                chunkZ = raw.chunkZ,
-                checksum = raw.checksum
-            }, {
-                type = "offer",
-                key = key,
-                tile = raw
-            })
-            return
+    local capabilities = serverInfo
+        and type(serverInfo.capabilities) == "table"
+        and serverInfo.capabilities or {}
+    if capabilities.bulkUploads then
+        local inFlightUploads = 0
+        for _, pending in pairs(pendingNetwork) do
+            if pending.type == "upload_batch" then
+                inFlightUploads = inFlightUploads + 1
+            end
+        end
+        if inFlightUploads < 3 then
+            local keys = {}
+            local rawTiles = {}
+            local tilesByKey = {}
+            local maximum = math.min(
+                DOWNLOAD_BATCH_SIZE,
+                tonumber(capabilities.maxBulkUploads)
+                    or DOWNLOAD_BATCH_SIZE)
+            for key, raw in pairs(uploadQueue) do
+                local retry = uploadRetry[key]
+                if not pendingKeys[key]
+                    and (not retry or nowMs() >= retry.after) then
+                    keys[#keys + 1] = key
+                    rawTiles[#rawTiles + 1] = raw
+                    tilesByKey[key] = raw
+                    if #keys >= maximum then break end
+                end
+            end
+            if #keys > 0 then
+                sendPending("put_tiles", {
+                    tiles = rawTiles
+                }, {
+                    type = "upload_batch",
+                    keys = keys,
+                    tiles = tilesByKey
+                })
+                return
+            end
+        end
+    end
+
+    if not capabilities.bulkUploads then
+        for key, raw in pairs(uploadQueue) do
+            local retry = uploadRetry[key]
+            if not pendingKeys[key]
+                and (not retry or nowMs() >= retry.after) then
+                sendPending("offer_tile", {
+                    dimension = raw.dimension,
+                    chunkX = raw.chunkX,
+                    chunkZ = raw.chunkZ,
+                    checksum = raw.checksum
+                }, {
+                    type = "offer",
+                    key = key,
+                    tile = raw
+                })
+                return
+            end
         end
     end
 
     local inFlightDownloads = 0
+    local inFlightWindows = 0
     for _, pending in pairs(pendingNetwork) do
         if pending.type == "download"
-            or pending.type == "download_batch" then
+            or pending.type == "download_batch"
+            or pending.type == "download_window" then
             inFlightDownloads = inFlightDownloads + 1
+            if pending.type == "download_window" then
+                inFlightWindows = inFlightWindows + 1
+            end
         end
     end
     if inFlightDownloads >= MAX_IN_FLIGHT_DOWNLOADS then return end
+
+    if capabilities.tileWindows and inFlightWindows > 0 then return end
+    if capabilities.tileWindows and inFlightDownloads == 0 then
+        local windowSize = math.min(
+            DOWNLOAD_WINDOW_SIZE,
+            tonumber(capabilities.maxWindowTiles)
+                or DOWNLOAD_WINDOW_SIZE)
+        local choices = nextQueuedDownloads(windowSize)
+        if #choices > 0 then
+            local requests = {}
+            local requestByKey = {}
+            local keys = {}
+            for _, choice in ipairs(choices) do
+                local request = choice.request
+                requests[#requests + 1] = {
+                    dimension = request.dimension,
+                    chunkX = request.chunkX,
+                    chunkZ = request.chunkZ,
+                    checksum = request.knownChecksum
+                }
+                requestByKey[choice.key] = request
+                keys[#keys + 1] = choice.key
+            end
+            sendPending("get_tile_window", {
+                tiles = requests
+            }, {
+                type = "download_window",
+                keys = keys,
+                requests = requestByKey,
+                receivedSegments = {},
+                receivedCount = 0
+            })
+            return
+        end
+    end
 
     local bulkSupported = serverInfo
         and type(serverInfo.capabilities) == "table"
@@ -1704,6 +2329,52 @@ local function clearPending(request)
     end
 end
 
+local function acceptNetworkTile(raw, request)
+    if request and request.cacheOnly then
+        local valid = atlas.validateTile(raw)
+        if not valid then return false end
+        local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
+        local cached = cacheIndex.tiles[key]
+        local pendingWrite = cacheWriteQueue[key]
+        if cached and cached.unsynced and cached.checksum ~= raw.checksum then
+            return false
+        end
+        if pendingWrite and pendingWrite.unsynced
+            and pendingWrite.raw.checksum ~= raw.checksum then
+            return false
+        end
+        queueLocalSave(raw, false, true)
+        serverVerifiedAt[key] = nowMs()
+        return true
+    end
+    local ok = pcall(installRawTile, raw, "network")
+    return ok
+end
+
+local function handleDownloadItem(item, key, request)
+    if item.status == "data" and item.tile then
+        local ok = acceptNetworkTile(item.tile, request)
+        if ok then downloadQueue[key] = nil end
+    elseif item.status == "current" then
+        downloadQueue[key] = nil
+        serverVerifiedAt[key] = nowMs()
+    elseif item.status == "missing" then
+        downloadQueue[key] = nil
+        local localTile = tiles[key]
+        local raw = localTile and localTile.raw
+            or loadLocalRaw(
+                request.dimension, request.chunkX, request.chunkZ)
+        if raw then
+            queueUpload(raw)
+        else
+            networkMissUntil[key] = nowMs() + NETWORK_MISS_MS
+        end
+    elseif item.status == "unavailable" then
+        request.notBefore = nowMs() + 3000
+        scanStatus = "SHARED TILE OFFLINE"
+    end
+end
+
 local function handleNetworkMessage(sender, message)
     if sender ~= serverId or type(message) ~= "table"
         or message.atlas ~= atlas.VERSION then return end
@@ -1723,9 +2394,85 @@ local function handleNetworkMessage(sender, message)
 
     local pending = message.requestId and pendingNetwork[message.requestId]
     if not pending then return end
+    if pending.type == "download_window"
+        and message.op == "tiles_segment"
+        and type(message.segment) == "number"
+        and type(message.segments) == "number"
+        and type(message.items) == "table" then
+        pending.sentAt = nowMs()
+        local segment = message.segment
+        if not pending.receivedSegments[segment] then
+            pending.receivedSegments[segment] = true
+            pending.receivedCount = pending.receivedCount + 1
+            pending.segmentCount = message.segments
+            for _, item in ipairs(message.items) do
+                if type(item) == "table"
+                    and type(item.dimension) == "string"
+                    and type(item.chunkX) == "number"
+                    and type(item.chunkZ) == "number" then
+                    local key = tileKey(
+                        item.dimension, item.chunkX, item.chunkZ)
+                    local request = pending.requests[key]
+                    if request then
+                        handleDownloadItem(item, key, request)
+                    end
+                end
+            end
+        end
+        atlas.send(serverId, "tiles_segment_ack", {
+            requestId = pending.requestId,
+            segment = segment
+        })
+        if pending.receivedCount >= message.segments then
+            clearPending(pending)
+        end
+        return
+    end
     clearPending(pending)
 
-    if pending.type == "offer" then
+    if pending.type == "upload_batch" then
+        local handled = {}
+        if message.op == "tiles_stored"
+            and type(message.items) == "table" then
+            for _, item in ipairs(message.items) do
+                if type(item) == "table"
+                    and type(item.dimension) == "string"
+                    and type(item.chunkX) == "number"
+                    and type(item.chunkZ) == "number" then
+                    local key = tileKey(
+                        item.dimension, item.chunkX, item.chunkZ)
+                    local raw = pending.tiles[key]
+                    if raw then
+                        handled[key] = true
+                        if item.status == "stored"
+                            or item.status == "duplicate" then
+                            markSynced(raw)
+                        else
+                            scheduleUploadRetry({
+                                key = key,
+                                tile = raw
+                            }, item.reason or item.status)
+                        end
+                    end
+                end
+            end
+        end
+        for key, raw in pairs(pending.tiles) do
+            if not handled[key] then
+                scheduleUploadRetry({
+                    key = key,
+                    tile = raw
+                }, message.reason or message.status or "incomplete batch reply")
+            end
+        end
+    elseif pending.type == "catalog" then
+        if message.op == "catalog_page" then
+            acceptCatalogPage(message)
+        else
+            catalogState.pending = false
+            catalogState.nextAt = nowMs() + 1000
+        end
+    elseif pending.type == "offer" then
         if message.op == "tile_have" then
             markSynced(pending.tile)
         elseif message.op == "tile_send" then
@@ -1751,27 +2498,22 @@ local function handleNetworkMessage(sender, message)
         end
     elseif pending.type == "download" then
         if message.op == "tile_data" and message.tile then
-            local ok = pcall(installRawTile, message.tile, "network")
-            if ok then downloadQueue[pending.key] = nil end
+            handleDownloadItem({
+                status = "data",
+                tile = message.tile
+            }, pending.key, pending.request)
         elseif message.op == "tile_current" then
-            downloadQueue[pending.key] = nil
-            serverVerifiedAt[pending.key] = nowMs()
+            handleDownloadItem({
+                status = "current"
+            }, pending.key, pending.request)
         elseif message.op == "tile_missing" then
-            downloadQueue[pending.key] = nil
-            local request = pending.request
-            local localTile = tiles[pending.key]
-            local raw = localTile and localTile.raw
-                or loadLocalRaw(
-                    request.dimension, request.chunkX, request.chunkZ)
-            if raw then
-                queueUpload(raw)
-            else
-                networkMissUntil[pending.key] =
-                    nowMs() + NETWORK_MISS_MS
-            end
+            handleDownloadItem({
+                status = "missing"
+            }, pending.key, pending.request)
         elseif message.op == "tile_unavailable" then
-            pending.request.notBefore = nowMs() + 3000
-            scanStatus = "SHARED TILE OFFLINE"
+            handleDownloadItem({
+                status = "unavailable"
+            }, pending.key, pending.request)
         end
     elseif pending.type == "download_batch"
         and message.op == "tiles_data"
@@ -1784,33 +2526,8 @@ local function handleNetworkMessage(sender, message)
                 local key = tileKey(
                     item.dimension, item.chunkX, item.chunkZ)
                 if pending.requests[key] then
-                    if item.status == "data" and item.tile then
-                        local ok = pcall(
-                            installRawTile, item.tile, "network")
-                        if ok then downloadQueue[key] = nil end
-                    elseif item.status == "current" then
-                        downloadQueue[key] = nil
-                        serverVerifiedAt[key] = nowMs()
-                    elseif item.status == "missing" then
-                        downloadQueue[key] = nil
-                        local request = pending.requests[key]
-                        local localTile = tiles[key]
-                        local raw = localTile and localTile.raw
-                            or loadLocalRaw(
-                                request.dimension,
-                                request.chunkX,
-                                request.chunkZ)
-                        if raw then
-                            queueUpload(raw)
-                        else
-                            networkMissUntil[key] =
-                                nowMs() + NETWORK_MISS_MS
-                        end
-                    elseif item.status == "unavailable" then
-                        local request = pending.requests[key]
-                        request.notBefore = nowMs() + 3000
-                        scanStatus = "SHARED TILE OFFLINE"
-                    end
+                    handleDownloadItem(
+                        item, key, pending.requests[key])
                 end
             end
         end
@@ -1824,6 +2541,16 @@ local function expireNetworkRequests()
             clearPending(request)
             if request.type == "offer" or request.type == "upload" then
                 scheduleUploadRetry(request, "network timeout")
+            elseif request.type == "upload_batch" then
+                for key, raw in pairs(request.tiles) do
+                    scheduleUploadRetry({
+                        key = key,
+                        tile = raw
+                    }, "network timeout")
+                end
+            elseif request.type == "catalog" then
+                catalogState.pending = false
+                catalogState.nextAt = currentTime + 1000
             end
         end
     end
@@ -1974,10 +2701,13 @@ local function refreshPrefetch()
     local chunkX = math.floor(info.x / 16)
     local chunkZ = math.floor(info.z / 16)
 
-    for dz = -4, 4 do
-        for dx = -4, 4 do
+    for dz = -CACHE_POLICY.localRadiusChunks,
+            CACHE_POLICY.localRadiusChunks do
+        for dx = -CACHE_POLICY.localRadiusChunks,
+                CACHE_POLICY.localRadiusChunks do
             local distance = dx * dx + dz * dz
-            if distance <= 16 then
+            if distance <= CACHE_POLICY.localRadiusChunks
+                    * CACHE_POLICY.localRadiusChunks then
                 loadCachedTileIfPresent(
                     info.dimension, chunkX + dx, chunkZ + dz)
                 queueDownload(
@@ -1988,17 +2718,24 @@ local function refreshPrefetch()
     end
 
     local directionX, directionZ = scanDirection()
-    for dz = -12, 12 do
-        for dx = -12, 12 do
-            local distance = math.sqrt(dx * dx + dz * dz)
-            if distance <= 12 and distance > 0 then
-                local forward = dx * directionX + dz * directionZ
-                local cross = math.abs(dx * directionZ - dz * directionX)
-                if forward > 0 and cross <= 1.5 + forward * 0.45 then
-                    queueDownload(info.dimension, chunkX + dx, chunkZ + dz,
-                        30 + distance)
-                end
-            end
+    local forwardHorizon = clamp(
+        math.ceil(motion.speed * 20 / 16),
+        CACHE_POLICY.localRadiusChunks,
+        CACHE_POLICY.forwardMaxChunks)
+    local perpendicularX = -directionZ
+    local perpendicularZ = directionX
+    for forward = 1, forwardHorizon do
+        local halfWidth = math.min(12, math.ceil(2 + forward * 0.25))
+        for cross = -halfWidth, halfWidth do
+            local targetX = math.floor(
+                chunkX + directionX * forward
+                    + perpendicularX * cross + 0.5)
+            local targetZ = math.floor(
+                chunkZ + directionZ * forward
+                    + perpendicularZ * cross + 0.5)
+            queueDownload(
+                info.dimension, targetX, targetZ,
+                20 + forward + math.abs(cross))
         end
     end
 
@@ -2014,29 +2751,82 @@ local function refreshPrefetch()
     queueVisibleMap()
 end
 
-local function evictCacheIfNeeded()
-    local details = atlas.capacity("/")
-    if type(details.capacity) ~= "number"
-        or type(details.free) ~= "number" then return end
-    local reserve = details.capacity * 0.02
-    if details.free >= reserve then return end
-
-    local candidates = {}
-    for key, entry in pairs(cacheIndex.tiles) do
-        if not entry.unsynced and not tiles[key] then
-            candidates[#candidates + 1] = { key = key, entry = entry }
-        end
+local function cacheTileDistance(key)
+    local dimension, chunkX, chunkZ =
+        key:match("^(.-)|(-?%d+)|(-?%d+)$")
+    chunkX, chunkZ = tonumber(chunkX), tonumber(chunkZ)
+    if not info or not chunkX or dimension ~= info.dimension then
+        return math.huge
     end
-    table.sort(candidates, function(a, b)
-        return (a.entry.lastUsed or 0) < (b.entry.lastUsed or 0)
-    end)
-    for _, candidate in ipairs(candidates) do
-        if atlas.capacity("/").free >= reserve then break end
-        if fs.exists(candidate.entry.path) then
-            pcall(fs.delete, candidate.entry.path)
+    local currentX = math.floor(info.x / 16)
+    local currentZ = math.floor(info.z / 16)
+    local best = math.sqrt(
+        (chunkX - currentX) ^ 2 + (chunkZ - currentZ) ^ 2)
+    for index = activeWaypoint, #waypoints do
+        local waypoint = waypoints[index]
+        local waypointX = math.floor(waypoint.x / 16)
+        local waypointZ = math.floor(waypoint.z / 16)
+        best = math.min(best, math.sqrt(
+            (chunkX - waypointX) ^ 2 + (chunkZ - waypointZ) ^ 2))
+    end
+    return best
+end
+
+local function evictCacheIfNeeded(extraBytes)
+    refreshCacheVolumes(false)
+    extraBytes = math.max(0, tonumber(extraBytes) or 0)
+    local currentTime = nowMs()
+    for _, volume in ipairs(cacheVolumes) do
+        local details = atlas.capacity(volume.mount)
+        if type(details.capacity) == "number"
+            and type(details.free) == "number" then
+            local targetFree =
+                details.capacity * CACHE_POLICY.reserveFraction + extraBytes
+            if details.free < targetFree then
+                local candidates = {}
+                for key, entry in pairs(cacheIndex.tiles) do
+                    if (entry.volumeId or "computer") == volume.id
+                        and not entry.unsynced
+                        and not uploadQueue[key]
+                        and not cacheWriteQueue[key]
+                        and not pendingKeys[key] then
+                        local distance = cacheTileDistance(key)
+                        if distance > CACHE_POLICY.localRadiusChunks then
+                            candidates[#candidates + 1] = {
+                                key = key,
+                                entry = entry,
+                                distance = distance
+                            }
+                        end
+                    end
+                end
+                table.sort(candidates, function(a, b)
+                    if a.distance == b.distance then
+                        return (a.entry.lastUsed or 0)
+                            < (b.entry.lastUsed or 0)
+                    end
+                    return a.distance > b.distance
+                end)
+                for _, candidate in ipairs(candidates) do
+                    local latest = atlas.capacity(volume.mount)
+                    if type(latest.free) ~= "number"
+                        or latest.free >= targetFree then break end
+                    local path = cacheEntryPath(candidate.entry)
+                    if path and fs.exists(path) then pcall(fs.delete, path) end
+                    cacheIndex.tiles[candidate.key] = nil
+                    cacheEvictedUntil[candidate.key] =
+                        currentTime + CACHE_POLICY.evictionCooldownMs
+                    local loaded = tiles[candidate.key]
+                    if loaded then
+                        tiles[candidate.key] = nil
+                        tileCount = math.max(0, tileCount - 1)
+                        invalidateTileDependencies(
+                            loaded.dimension, loaded.chunkX, loaded.chunkZ)
+                    end
+                    cacheDirty = true
+                end
+            end
         end
-        cacheIndex.tiles[candidate.key] = nil
-        cacheDirty = true
     end
 end
 
@@ -2056,6 +2846,7 @@ local function networkLoop()
         elseif event[1] == "timer" and event[2] == timer then
             local currentTime = nowMs()
             expireNetworkRequests()
+            processCatalogMirror()
             processNetworkQueue()
             if currentTime - lastHeartbeat >= HEARTBEAT_MS then
                 heartbeat()
@@ -2079,20 +2870,62 @@ local function networkLoop()
 end
 
 local function cacheLoop()
+    local lastPrefetch = 0
+    local lastMaintenance = 0
     while running do
-        for key, entry in pairs(cacheIndex.tiles) do
-            if entry.unsynced and not uploadQueue[key] then
-                local raw = atlas.loadTile(entry.path)
-                if raw then uploadQueue[key] = raw end
+        local currentTime = nowMs()
+        refreshCacheVolumes(false)
+
+        local writes = 0
+        for key, pendingWrite in pairs(cacheWriteQueue) do
+            if writes >= CACHE_WRITES_PER_TICK then break end
+            if currentTime >= (pendingWrite.notBefore or 0) then
+                local ok, reason = saveLocalRaw(
+                    pendingWrite.raw, pendingWrite.unsynced)
+                if not ok and reason == "onboard cache is full"
+                    and not pendingWrite.background then
+                    evictCacheIfNeeded(8192)
+                    ok, reason = saveLocalRaw(
+                        pendingWrite.raw, pendingWrite.unsynced)
+                end
+                if ok then
+                    cacheWriteQueue[key] = nil
+                elseif reason == "onboard cache is full"
+                    and pendingWrite.background then
+                    cacheWriteQueue[key] = nil
+                    cacheEvictedUntil[key] =
+                        currentTime + CACHE_POLICY.evictionCooldownMs
+                else
+                    pendingWrite.attempts =
+                        (pendingWrite.attempts or 0) + 1
+                    pendingWrite.notBefore = currentTime
+                        + math.min(5000, 250 * 2
+                            ^ math.min(pendingWrite.attempts, 4))
+                end
+                writes = writes + 1
             end
         end
-        refreshPrefetch()
-        evictCacheIfNeeded()
-        if cacheDirty then
-            atlas.writeTable(CACHE_META_PATH, cacheIndex)
-            cacheDirty = false
+
+        if currentTime - lastPrefetch >= 1000 then
+            refreshPrefetch()
+            lastPrefetch = currentTime
         end
-        if not waitSeconds(1) then return end
+        if currentTime - lastMaintenance >= 5000 then
+            for key, entry in pairs(cacheIndex.tiles) do
+                if entry.unsynced and not uploadQueue[key] then
+                    local path = cacheEntryPath(entry)
+                    local raw = path and atlas.loadTile(path)
+                    if raw then uploadQueue[key] = raw end
+                end
+            end
+            evictCacheIfNeeded()
+            if cacheDirty then
+                atlas.writeTable(CACHE_META_PATH, cacheIndex)
+                cacheDirty = false
+            end
+            lastMaintenance = currentTime
+        end
+        if not waitSeconds(0.05) then return end
     end
 end
 
