@@ -166,6 +166,10 @@ allay install atlas-station
 atlas-station
 ```
 
+Fresh empty floppies appear as `UNFORMATTED`. Open Storage, enter maintenance,
+and use `INIT` for the selected disk or `INIT ALL` (`A`) for every empty disk
+in the rack. `INIT ALL` never touches disks marked `FOREIGN`.
+
 On each aircraft computer:
 
 ```text
@@ -185,13 +189,17 @@ Navigator for compatibility with the earlier terrain-map prototype.
 Controls:
 
 - `+` / `-` or mouse wheel: zoom in and out
+- Click, scroll, or drag over the map: show surface, clearance, and fluid
+  details for that map point
 - Arrow keys: pan and leave follow mode
-- Space: recenter and resume follow mode
+- Space, Escape, `B`, or the `HOME` button: recenter and resume follow mode
 - `G`: toggle chunk grid
 - `C`: toggle 10-block contour lines
 - `O`: toggle clearance-obstacle stippling
 - `W`: enter an exact waypoint
-- Left-click the map: append a waypoint
+- Left-click the map: append a waypoint immediately
+- Right-click a waypoint marker: delete that waypoint
+- `X` or the `DEL` button: delete the active waypoint
 - `N`: advance to the next waypoint
 - `H`: calibrate CC:Sable heading to the current straight-line ground track
 - `R`: rescan the current chunk
@@ -200,6 +208,17 @@ Controls:
 The zoom levels range from four blocks per pixel to eight pixels per block.
 Unknown tiles remain dark until the aircraft loads them and the surveyor
 finishes scanning them.
+
+The navigator polls position and redraws at the Minecraft tick rate. Each poll
+can scan up to four queued chunks, while its network queue is serviced every
+tick. The station storage screen provides clickable maintenance controls and
+expanded details for the selected disk. If only a wired modem is present, the
+station remains usable in `WIRED` mode and automatically enables wireless
+service when an Ender Modem is attached.
+
+Unsynced terrain remains in the aircraft cache. Deferred, rejected, or timed
+out uploads retry automatically with exponential backoff, capped at 30 seconds,
+so maintenance or temporarily missing station storage cannot lose survey data.
 
 ## Build
 

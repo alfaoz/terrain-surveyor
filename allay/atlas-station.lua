@@ -1,6 +1,6 @@
 return {
     name = "atlas-station",
-    version = "1.0.0",
+    version = "1.1.0",
     description = "ATLAS home terrain database, storage rack, and traffic server",
     author = "alfaoz",
 
@@ -13,7 +13,7 @@ return {
     },
 
     hashes = {
-        ["station.lua"] = "1a1a66257ffd354f8068639712ac8895d7f4fd5d3f0e9aa7dd99701ab23bfa77"
+        ["station.lua"] = "0520b132d5f404f67c4647f8df6912deb4261bb6e5b6418f2b6ea6d0af0c6f00"
     },
 
     dependencies = { "atlas-core" },

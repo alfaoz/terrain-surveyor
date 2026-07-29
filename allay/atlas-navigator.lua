@@ -1,6 +1,6 @@
 return {
     name = "atlas-navigator",
-    version = "1.0.0",
+    version = "1.1.0",
     description = "ATLAS CC:Graphics aircraft terrain and waypoint navigator",
     author = "alfaoz",
 
@@ -13,7 +13,7 @@ return {
     },
 
     hashes = {
-        ["navigator.lua"] = "8922e946a3eee39c1d8a445acc6ea1a2218dd0de69b1e0fb640462f20934ceb1"
+        ["navigator.lua"] = "adfc1462e67b058d629eab3499db0a5e76161dd8f55ca059f312aaa04352c603"
     },
 
     dependencies = { "atlas-core" },

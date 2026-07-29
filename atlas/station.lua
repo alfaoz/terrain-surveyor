@@ -3,7 +3,8 @@ local atlas = dofile(LIBRARY)
 
 local CONFIG_PATH = "/atlas/station.cfg"
 local LOG_LIMIT = 80
-local DRIVE_RESCAN_SECONDS = 2
+local DRIVE_RESCAN_SECONDS = 1
+local UI_REFRESH_SECONDS = 0.10
 local TRAFFIC_STALE_MS = 5000
 local TRAFFIC_REMOVE_MS = 15000
 
@@ -22,6 +23,11 @@ local selectedDrive = 1
 local page = 1
 local notice = "STARTING"
 local job
+local uiButtons = {}
+local radioState = "NO MODEM"
+local radioDetail = "No modem detected"
+local hostedName
+local networkHosted = false
 local stats = {
     uploads = 0,
     downloads = 0,
@@ -45,6 +51,60 @@ local function tableCount(value)
     local count = 0
     for _ in pairs(value) do count = count + 1 end
     return count
+end
+
+local function ensureNetwork(quiet)
+    local wireless = {}
+    local wired = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(name, "modem") then
+            local modem = peripheral.wrap(name)
+            local okWireless, isWireless = pcall(modem.isWireless)
+            if okWireless and isWireless then
+                wireless[#wireless + 1] = name
+            else
+                wired[#wired + 1] = name
+            end
+            if not rednet.isOpen(name) then pcall(rednet.open, name) end
+        end
+    end
+    table.sort(wireless)
+    table.sort(wired)
+
+    local previousState = radioState
+    if #wireless > 0 then
+        radioState = "WIRELESS"
+        radioDetail = "Wireless: " .. table.concat(wireless, ", ")
+    elseif #wired > 0 then
+        radioState = "WIRED"
+        radioDetail = "Wired only: " .. table.concat(wired, ", ")
+    else
+        radioState = "NO MODEM"
+        radioDetail = "No modem detected"
+    end
+
+    if #wireless + #wired == 0 then
+        if networkHosted and hostedName then
+            pcall(rednet.unhost, atlas.PROTOCOL_DISCOVERY)
+        end
+        networkHosted = false
+    elseif not networkHosted then
+        local candidate = atlas.safeName(config.name)
+        local hostOk = pcall(
+            rednet.host, atlas.PROTOCOL_DISCOVERY, candidate)
+        if not hostOk then
+            candidate = atlas.safeName(
+                config.name .. "-" .. os.getComputerID())
+            rednet.host(atlas.PROTOCOL_DISCOVERY, candidate)
+        end
+        hostedName = candidate
+        networkHosted = true
+    end
+
+    if not quiet and previousState ~= radioState then
+        log(radioDetail, radioState == "WIRELESS" and "INFO" or "WARN")
+    end
+    return #wireless, #wired
 end
 
 local function isEmptyDirectory(path)
@@ -356,6 +416,32 @@ local function initialiseSelectedDrive()
     rescanDrives(true)
 end
 
+local function initialiseAllDrives()
+    local targets = {}
+    for _, state in ipairs(drives) do
+        if state.status == "UNFORMATTED" then
+            targets[#targets + 1] = state.name
+        end
+    end
+    if #targets == 0 then
+        log("No empty unformatted floppies found", "WARN")
+        return
+    end
+
+    local initialized = 0
+    for _, targetName in ipairs(targets) do
+        for index, state in ipairs(drives) do
+            if state.name == targetName and state.status == "UNFORMATTED" then
+                selectedDrive = index
+                initialiseSelectedDrive()
+                initialized = initialized + 1
+                break
+            end
+        end
+    end
+    log(("%d ATLAS volume(s) initialized"):format(initialized))
+end
+
 local function selectedVolume()
     local state = drives[selectedDrive]
     if not state or not state.id then return nil end
@@ -532,6 +618,9 @@ local function handleMessage(sender, message)
                     stats.uploads = stats.uploads + 1
                 end
                 atlas.reply(sender, message, "tile_stored", { status = status })
+            elseif status == "no ATLAS volume has enough free space" then
+                atlas.reply(sender, message, "deferred", { reason = status })
+                log("Upload deferred until storage is available", "WARN")
             else
                 stats.rejected = stats.rejected + 1
                 atlas.reply(sender, message, "tile_error", { reason = status })
@@ -589,6 +678,21 @@ local function clearLine(y, background)
     writeAt(1, y, string.rep(" ", width), colors.white, background)
 end
 
+local function drawButton(x, y, label, action, enabled)
+    local text = " " .. label .. " "
+    local foreground = enabled and colors.white or colors.gray
+    local background = enabled and colors.blue or colors.black
+    writeAt(x, y, text, foreground, background)
+    uiButtons[#uiButtons + 1] = {
+        x1 = x,
+        x2 = x + #text - 1,
+        y = y,
+        action = action,
+        enabled = enabled
+    }
+    return x + #text + 1
+end
+
 local function drawBar(x, y, width, used, capacity)
     local amount = 0
     if type(used) == "number" and type(capacity) == "number" and capacity > 0 then
@@ -603,9 +707,13 @@ end
 local function drawHeader(width)
     clearLine(1, colors.blue)
     writeAt(2, 1, "ATLAS STATION", colors.white, colors.blue)
-    local state = maintenance and "MAINT" or "ONLINE"
+    local state = maintenance and "MAINT" or radioState
+    local stateColor = maintenance and colors.yellow
+        or radioState == "WIRELESS" and colors.lime
+        or radioState == "WIRED" and colors.yellow
+        or colors.red
     writeAt(width - #state, 1, state,
-        maintenance and colors.yellow or colors.lime, colors.blue)
+        stateColor, colors.blue)
 
     clearLine(2, colors.black)
     local x = 1
@@ -625,6 +733,9 @@ local function drawOverview(width, height)
     writeAt(2, 5, ("TILES       %d"):format(tableCount(tileIndex)), colors.white)
     writeAt(2, 6, ("VOLUMES     %d"):format(tableCount(volumes)), colors.white)
     writeAt(2, 7, ("AIRCRAFT    %d"):format(tableCount(aircraft)), colors.white)
+    writeAt(2, 8, fit("LINK        " .. radioDetail, width - 3),
+        radioState == "WIRELESS" and colors.lime
+            or radioState == "WIRED" and colors.yellow or colors.red)
     writeAt(2, 9, "STORAGE", colors.lightGray)
     drawBar(2, 10, math.max(10, width - 4), used, capacity)
     writeAt(2, 11, ("%s FREE / %s"):format(
@@ -648,7 +759,7 @@ local function drawStorage(width, height)
         or "PRESS M TO ENTER MAINTENANCE",
         maintenance and colors.yellow or colors.lightGray)
     local top = 6
-    local visible = math.max(1, height - top - 3)
+    local visible = math.max(1, height - top - 7)
     local first = math.max(1, math.min(selectedDrive, #drives) - visible + 1)
     for line = 0, visible - 1 do
         local index = first + line
@@ -667,16 +778,46 @@ local function drawStorage(width, height)
         writeAt(2, top + line, row,
             selected and colors.black or colors.white,
             selected and colors.lightBlue or colors.black)
+        uiButtons[#uiButtons + 1] = {
+            x1 = 2,
+            x2 = math.max(2, width - 1),
+            y = top + line,
+            action = "select:" .. index,
+            enabled = true
+        }
     end
     if #drives == 0 then
         writeAt(2, 7, "NO WIRED DISK DRIVES DETECTED", colors.orange)
     end
+
+    local selected = drives[selectedDrive]
+    if selected then
+        writeAt(2, height - 5, ("SELECTED %s  LABEL %s"):format(
+            fit(selected.name, 14), fit(selected.label or "-", 16)),
+            colors.lightBlue)
+        local capacity = selected.capacity or {}
+        local detail = ("%s  FREE %s / %s"):format(
+            selected.status,
+            atlas.formatBytes(capacity.free),
+            atlas.formatBytes(capacity.capacity))
+        if selected.tileCount then
+            detail = detail .. ("  %d TILES"):format(selected.tileCount)
+        end
+        writeAt(2, height - 4, detail, colors.lightGray)
+    end
+
+    local buttonX = 2
     if maintenance then
-        writeAt(2, height - 2, "I INITIALIZE  D DRAIN  E EJECT  R RESCAN",
-            colors.lightGray)
+        buttonX = drawButton(buttonX, height - 2, "INIT", "initialize", true)
+        buttonX = drawButton(
+            buttonX, height - 2, "INIT ALL", "initialize_all", true)
+        buttonX = drawButton(buttonX, height - 2, "DRAIN", "drain", true)
+        buttonX = drawButton(buttonX, height - 2, "EJECT", "eject", true)
+        buttonX = drawButton(buttonX, height - 2, "RESCAN", "rescan", true)
+        drawButton(buttonX, height - 2, "DONE", "maintenance", true)
     else
-        writeAt(2, height - 2, "UP/DOWN SELECT  R RESCAN  M MAINTENANCE",
-            colors.lightGray)
+        buttonX = drawButton(buttonX, height - 2, "RESCAN", "rescan", true)
+        drawButton(buttonX, height - 2, "MAINT", "maintenance", true)
     end
 end
 
@@ -715,6 +856,7 @@ local function draw()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
+    uiButtons = {}
     drawHeader(width)
     if page == 1 then drawOverview(width, height)
     elseif page == 2 then drawStorage(width, height)
@@ -726,8 +868,31 @@ local function draw()
     writeAt(width - 4, height, "Q EXIT", colors.white, colors.gray)
 end
 
+local function performUiAction(action)
+    local driveIndex = action:match("^select:(%d+)$")
+    if driveIndex then
+        selectedDrive = math.max(1, math.min(#drives, tonumber(driveIndex)))
+        local selected = drives[selectedDrive]
+        notice = selected and ("Selected " .. selected.name) or "No drive selected"
+    elseif action == "maintenance" then
+        maintenance = not maintenance
+        log(maintenance and "Maintenance mode entered"
+            or "Maintenance mode exited")
+    elseif action == "rescan" then
+        rescanDrives(false)
+    elseif maintenance and action == "initialize" then
+        initialiseSelectedDrive()
+    elseif maintenance and action == "initialize_all" then
+        initialiseAllDrives()
+    elseif maintenance and action == "drain" then
+        startDrain()
+    elseif maintenance and action == "eject" then
+        ejectSelected()
+    end
+end
+
 local function uiLoop()
-    local timer = os.startTimer(0.25)
+    local timer = os.startTimer(UI_REFRESH_SECONDS)
     draw()
     while running do
         local event = table.pack(os.pullEventRaw())
@@ -736,7 +901,7 @@ local function uiLoop()
             return
         elseif event[1] == "timer" and event[2] == timer then
             draw()
-            timer = os.startTimer(0.25)
+            timer = os.startTimer(UI_REFRESH_SECONDS)
         elseif event[1] == "term_resize" then
             draw()
         elseif event[1] == "char" then
@@ -747,17 +912,17 @@ local function uiLoop()
                 running = false
                 return
             elseif character == "m" then
-                maintenance = not maintenance
-                log(maintenance and "Maintenance mode entered"
-                    or "Maintenance mode exited")
+                performUiAction("maintenance")
             elseif character == "r" then
-                rescanDrives(false)
+                performUiAction("rescan")
             elseif maintenance and character == "i" then
-                initialiseSelectedDrive()
+                performUiAction("initialize")
+            elseif maintenance and character == "a" then
+                performUiAction("initialize_all")
             elseif maintenance and character == "d" then
-                startDrain()
+                performUiAction("drain")
             elseif maintenance and character == "e" then
-                ejectSelected()
+                performUiAction("eject")
             end
             draw()
         elseif event[1] == "key" then
@@ -769,6 +934,13 @@ local function uiLoop()
             draw()
         elseif event[1] == "mouse_click" then
             local _, _, x, y = table.unpack(event, 1, event.n)
+            for _, button in ipairs(uiButtons) do
+                if button.enabled and y == button.y
+                    and x >= button.x1 and x <= button.x2 then
+                    performUiAction(button.action)
+                    break
+                end
+            end
             if y == 2 then
                 local cursor = 1
                 for index, name in ipairs(PAGE_NAMES) do
@@ -805,11 +977,13 @@ local function driveLoop()
             return
         elseif event[1] == "timer" and event[2] == timer then
             rescanDrives(true)
+            ensureNetwork(false)
             timer = os.startTimer(DRIVE_RESCAN_SECONDS)
         elseif event[1] == "disk" or event[1] == "disk_eject"
             or event[1] == "peripheral"
             or event[1] == "peripheral_detach" then
             rescanDrives(true)
+            ensureNetwork(false)
         end
     end
 end
@@ -844,21 +1018,17 @@ end
 local function main()
     math.randomseed(atlas.now() + os.getComputerID())
     atlas.writeTable(CONFIG_PATH, config)
-    local modems = atlas.openWirelessRednet()
-    if #modems == 0 then error("ATLAS Station requires a wireless modem", 0) end
-
-    local hostedName = atlas.safeName(config.name)
-    local hostOk = pcall(rednet.host, atlas.PROTOCOL_DISCOVERY, hostedName)
-    if not hostOk then
-        hostedName = atlas.safeName(config.name .. "-" .. os.getComputerID())
-        rednet.host(atlas.PROTOCOL_DISCOVERY, hostedName)
-    end
+    ensureNetwork(true)
 
     rescanDrives(false)
-    log("ATLAS Link online as " .. hostedName)
+    if networkHosted then
+        log("ATLAS Link online as " .. hostedName)
+    else
+        log("ATLAS storage online; attach a modem for networking", "WARN")
+    end
     parallel.waitForAny(uiLoop, networkLoop, driveLoop, jobLoop, trafficLoop)
     running = false
-    pcall(rednet.unhost, atlas.PROTOCOL_DISCOVERY)
+    if networkHosted then pcall(rednet.unhost, atlas.PROTOCOL_DISCOVERY) end
 end
 
 local ok, failure = xpcall(main, debug.traceback)

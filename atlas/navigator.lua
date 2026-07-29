@@ -1,5 +1,5 @@
 -- ATLAS Navigator for:
---   Terrain Surveyor 0.1.3
+--   Terrain Surveyor 0.1.4
 --   CC: Tweaked 1.120.0
 --   CC: Graphics 0.2.0
 --
@@ -8,11 +8,12 @@
 local LIBRARY = fs.exists("/atlas/lib.lua") and "/atlas/lib.lua" or "atlas/lib.lua"
 local atlas = dofile(LIBRARY)
 
--- One Minecraft tick: 20 visual/position updates per second (4x the original).
+-- One Minecraft tick: 20 visual/position updates per second.
 local UPDATE_SECONDS = 0.05
+local SCANS_PER_POLL = 4
 local TILE_REFRESH_MS = 120000
 local RETRY_MS = 1500
-local NETWORK_TICK_SECONDS = 0.20
+local NETWORK_TICK_SECONDS = 0.05
 local HEARTBEAT_MS = 1000
 local TRAFFIC_MS = 1000
 local NETWORK_TIMEOUT_MS = 3000
@@ -100,6 +101,34 @@ end
 
 local function setPalette(index, rgb)
     term.setPaletteColor(index, rgb[1] / 255, rgb[2] / 255, rgb[3] / 255)
+end
+
+local originalTextPalette = {}
+for exponent = 0, 15 do
+    local color = 2 ^ exponent
+    local ok, red, green, blue = pcall(term.getPaletteColor, color)
+    if ok then originalTextPalette[color] = { red, green, blue } end
+end
+
+local function restoreTextPalette()
+    for exponent = 0, 15 do
+        local color = 2 ^ exponent
+        local red
+        local green
+        local blue
+        if term.nativePaletteColor then
+            local ok
+            ok, red, green, blue = pcall(term.nativePaletteColor, color)
+            if not ok then red = nil end
+        end
+        local saved = originalTextPalette[color]
+        red = red or (saved and saved[1])
+        green = green or (saved and saved[2])
+        blue = blue or (saved and saved[3])
+        if red and green and blue then
+            pcall(term.setPaletteColor, color, red, green, blue)
+        end
+    end
 end
 
 local function configurePalette()
@@ -258,6 +287,7 @@ local lastServerSeen = 0
 local pendingNetwork = {}
 local pendingKeys = {}
 local uploadQueue = {}
+local uploadRetry = {}
 local downloadQueue = {}
 local networkMissUntil = {}
 local traffic = {}
@@ -272,6 +302,7 @@ local previousPosition
 local scanPlanSignature
 local modal = false
 local lastDisplayMap
+local pointerDetails
 
 local function saveRoute()
     activeWaypoint = math.max(1, math.min(
@@ -433,6 +464,8 @@ end
 local function queueUpload(raw)
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
     uploadQueue[key] = atlas.copyTile(raw)
+    local retry = uploadRetry[key]
+    if retry and retry.checksum ~= raw.checksum then uploadRetry[key] = nil end
 end
 
 local function markSynced(raw)
@@ -443,6 +476,7 @@ local function markSynced(raw)
         cacheDirty = true
     end
     uploadQueue[key] = nil
+    uploadRetry[key] = nil
 end
 
 local function queueDownload(dimension, chunkX, chunkZ, priority)
@@ -617,6 +651,39 @@ local function getSample(worldX, worldZ, dimension)
     local sample = localZ * 16 + localX + 1
     return tile.surface[sample], tile.clearance[sample],
         tile.fluid[sample], tile.flags[sample]
+end
+
+local function inspectMapPoint(mouseX, mouseY)
+    local display = lastDisplayMap
+    if not display or not info
+        or mouseY < display.mapTop
+        or mouseY >= display.mapTop + display.mapHeight then
+        return false
+    end
+
+    local worldX = math.floor(display.mapViewX
+        + (mouseX - display.centerX) / display.pixelsPerBlock)
+    local worldZ = math.floor(display.mapViewZ
+        + (mouseY - display.mapTop - display.centerY)
+            / display.pixelsPerBlock)
+    local surface, clearance, fluid, flags = getSample(
+        worldX, worldZ, info.dimension)
+    local fluidKind = flags and flags % 4 or 0
+    local fluidLabel = fluidKind == 1 and "WATER"
+        or fluidKind == 2 and "LAVA"
+        or fluidKind == 3 and "FLUID"
+        or "-"
+
+    pointerDetails = {
+        at = nowMs(),
+        x = worldX,
+        z = worldZ,
+        text = ("MAP X:%d Z:%d SUR:%s CLR:%s FLD:%s"):format(
+            worldX, worldZ, tostring(surface or "?"),
+            tostring(clearance or "?"),
+            fluid and (fluidLabel .. "@" .. fluid) or "-")
+    }
+    return true
 end
 
 local function invalidateTileDependencies(dimension, chunkX, chunkZ)
@@ -919,18 +986,45 @@ local function fitText(text, width)
     return text:sub(1, math.max(0, maximum - 1)) .. "?"
 end
 
-local function drawAircraft(screenX, screenY, width, height, warning)
+local function drawToolbarButton(
+        buttons, x, y, label, action, width, height)
+    local buttonWidth = #label * 4 + 7
+    term.drawPixels(x, y, COLOR.panelEdge, buttonWidth, 7)
+    drawText(x + 4, y + 1, label, COLOR.text, width, height)
+    buttons[#buttons + 1] = {
+        x1 = x,
+        x2 = x + buttonWidth - 1,
+        y1 = y,
+        y2 = y + 6,
+        action = action
+    }
+    return x + buttonWidth + 2
+end
+
+local function drawAircraft(
+        screenX, screenY, heading, width, height, warning)
     local edge = COLOR.aircraftEdge
-    local center = warning and COLOR.warning or COLOR.aircraft
-    for offset = -3, 3 do
-        drawPixel(screenX + offset, screenY, edge, width, height)
-        drawPixel(screenX, screenY + offset, edge, width, height)
+    local fill = warning and COLOR.warning or COLOR.aircraft
+    local radians = math.rad(heading or 0)
+    local forwardX = math.sin(radians)
+    local forwardY = -math.cos(radians)
+    local rightX = math.cos(radians)
+    local rightY = math.sin(radians)
+
+    -- Filled 12-pixel-long triangle: a sharp nose and a broad trailing edge.
+    for longitudinal = -4, 7 do
+        local halfWidth = (7 - longitudinal) / 11 * 4
+        local integerWidth = math.floor(halfWidth + 0.5)
+        for lateral = -integerWidth, integerWidth do
+            local x = math.floor(screenX
+                + forwardX * longitudinal + rightX * lateral + 0.5)
+            local y = math.floor(screenY
+                + forwardY * longitudinal + rightY * lateral + 0.5)
+            local outline = longitudinal == -4 or longitudinal == 7
+                or math.abs(lateral) == integerWidth
+            drawPixel(x, y, outline and edge or fill, width, height)
+        end
     end
-    drawPixel(screenX - 1, screenY, center, width, height)
-    drawPixel(screenX + 1, screenY, center, width, height)
-    drawPixel(screenX, screenY - 1, center, width, height)
-    drawPixel(screenX, screenY + 1, center, width, height)
-    drawPixel(screenX, screenY, center, width, height)
 end
 
 local function drawLine(x0, y0, x1, y1, color, width, height)
@@ -1214,13 +1308,33 @@ local function render()
         or ("NO ACTIVE ROUTE SPD:%.1f"):format(motion.speed)
     drawText(2, footerY, fitText(routeLine, width),
         waypoint and COLOR.text or COLOR.textDim, width, height)
-    local status = ("MAP:%d %s NET:%s ZOOM:%s HDG:%s"):format(
-        tileCount, scanStatus, linkStatus, zoomLabel, motion.headingSource)
-    drawText(2, footerY + 7, fitText(status, width),
+    local status = ("MAP:%d %s NET:%s ZOOM:%s HDG:%s POLL:%dX"):format(
+        tileCount, scanStatus, linkStatus, zoomLabel,
+        motion.headingSource, SCANS_PER_POLL)
+    local detailActive = pointerDetails
+        and nowMs() - pointerDetails.at < 5000
+    drawText(2, footerY + 7,
+        fitText(detailActive and pointerDetails.text or status, width),
+        detailActive and COLOR.text or COLOR.textDim, width, height)
+    local toolbarY = footerY + 13
+    local toolbarButtons = {}
+    local toolbarX = 2
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "+", "zoom_in", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "-", "zoom_out", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "WP", "waypoint", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "NEXT", "next", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "DEL", "delete", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "HOME", "home", width, height)
+    drawText(toolbarX + 2, footerY + 14,
+        fitText("LCLICK ADD  RCLICK WP DELETE", width - toolbarX - 2),
         COLOR.textDim, width, height)
-    drawText(2, footerY + 14,
-        fitText("W WAYPOINT N NEXT H HDG-CAL +/- ZOOM Q EXIT", width),
-        COLOR.textDim, width, height)
+    lastDisplayMap.buttons = toolbarButtons
 
     drawText(width - 7, mapTop + 3, "N", COLOR.text, width, height)
     for arrowY = mapTop + 9, mapTop + 14 do
@@ -1236,7 +1350,8 @@ local function render()
             + (info.z - displayMapViewZ) * pixelsPerBlock + 0.5)
     local _, clearance = getSample(math.floor(info.x), math.floor(info.z), info.dimension)
     local terrainWarning = clearance and info.y <= clearance + 5
-    drawAircraft(aircraftX, aircraftY, width, height, terrainWarning)
+    drawAircraft(aircraftX, aircraftY, motion.heading,
+        width, height, terrainWarning)
     term.setFrozen(false)
 end
 
@@ -1251,6 +1366,15 @@ local function pan(dx, dz)
     local amount = math.max(1, math.floor(24 / zoom()))
     viewX = viewX + dx * amount
     viewZ = viewZ + dz * amount
+end
+
+local function returnHomeView()
+    follow = true
+    pointerDetails = nil
+    if info then
+        viewX = info.x
+        viewZ = info.z
+    end
 end
 
 local function refreshInfo()
@@ -1297,7 +1421,9 @@ local function refreshInfo()
         end
     end
 
-    scanOne(info)
+    for _ = 1, SCANS_PER_POLL do
+        if not scanOne(info) then break end
+    end
     return true
 end
 
@@ -1312,6 +1438,21 @@ local function sendPending(operation, payload, pending)
     pendingNetwork[requestId] = pending
     if pending.key then pendingKeys[pending.key] = requestId end
     return true
+end
+
+local function scheduleUploadRetry(request, reason)
+    if not request or not request.key or not request.tile then return end
+    local previous = uploadRetry[request.key]
+    local attempts = previous and previous.checksum == request.tile.checksum
+        and previous.attempts + 1 or 1
+    local delay = math.min(30000, 1000 * 2 ^ math.min(attempts - 1, 5))
+    uploadRetry[request.key] = {
+        checksum = request.tile.checksum,
+        attempts = attempts,
+        after = nowMs() + delay,
+        reason = tostring(reason or "no acknowledgement")
+    }
+    scanStatus = ("SYNC RETRY %ds"):format(math.ceil(delay / 1000))
 end
 
 local function nextQueuedDownload()
@@ -1330,7 +1471,9 @@ local function processNetworkQueue()
     if not serverId or linkStatus == "LOST" then return end
 
     for key, raw in pairs(uploadQueue) do
-        if not pendingKeys[key] then
+        local retry = uploadRetry[key]
+        if not pendingKeys[key]
+            and (not retry or nowMs() >= retry.after) then
             sendPending("offer_tile", {
                 dimension = raw.dimension,
                 chunkX = raw.chunkX,
@@ -1398,10 +1541,18 @@ local function handleNetworkMessage(sender, message)
                 key = pending.key,
                 tile = pending.tile
             })
+        elseif message.op == "denied"
+            or message.op == "deferred"
+            or message.op == "tile_error" then
+            scheduleUploadRetry(pending, message.reason or message.op)
         end
     elseif pending.type == "upload" then
         if message.op == "tile_stored" then
             markSynced(pending.tile)
+        elseif message.op == "denied"
+            or message.op == "deferred"
+            or message.op == "tile_error" then
+            scheduleUploadRetry(pending, message.reason or message.op)
         end
     elseif pending.type == "download" then
         if message.op == "tile_data" and message.tile then
@@ -1419,6 +1570,9 @@ local function expireNetworkRequests()
     for _, request in pairs(pendingNetwork) do
         if currentTime - request.sentAt > NETWORK_TIMEOUT_MS then
             clearPending(request)
+            if request.type == "offer" or request.type == "upload" then
+                scheduleUploadRetry(request, "network timeout")
+            end
         end
     end
 end
@@ -1634,12 +1788,51 @@ local function addWaypoint(worldX, worldZ, altitude, name)
     if #waypoints == 1 then activeWaypoint = 1 end
     scanPlanSignature = nil
     saveRoute()
+    pointerDetails = nil
+    scanStatus = "ADDED " .. tostring(
+        waypoints[#waypoints].name or ("WP" .. #waypoints))
+end
+
+local function removeWaypoint(index)
+    if not waypoints[index] then return false end
+    local removed = table.remove(waypoints, index)
+    if #waypoints == 0 then
+        activeWaypoint = 1
+    elseif index < activeWaypoint then
+        activeWaypoint = activeWaypoint - 1
+    else
+        activeWaypoint = math.min(activeWaypoint, #waypoints)
+    end
+    scanPlanSignature = nil
+    saveRoute()
+    scanStatus = "REMOVED " .. tostring(removed.name or ("WP" .. index))
+    return true
+end
+
+local function waypointAtPointer(mouseX, mouseY, display)
+    local bestIndex
+    local bestDistance = 9
+    for index, waypoint in ipairs(waypoints) do
+        local screenX = display.centerX
+            + (waypoint.x - display.mapViewX) * display.pixelsPerBlock
+        local screenY = display.mapTop + display.centerY
+            + (waypoint.z - display.mapViewZ) * display.pixelsPerBlock
+        local dx = screenX - mouseX
+        local dy = screenY - mouseY
+        local distance = math.sqrt(dx * dx + dy * dy)
+        if distance < bestDistance then
+            bestIndex = index
+            bestDistance = distance
+        end
+    end
+    return bestIndex
 end
 
 local function waypointEditor()
     modal = true
     pcall(term.setFrozen, false)
     pcall(term.setGraphicsMode, false)
+    restoreTextPalette()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
@@ -1649,8 +1842,17 @@ local function waypointEditor()
     write("Name [WP" .. (#waypoints + 1) .. "]: ")
     local name = read()
     if name == "" then name = "WP" .. (#waypoints + 1) end
-    write("X coordinate: ")
-    local x = tonumber(read())
+    write("X coordinate (blank cancels): ")
+    local xText = read()
+    if xText == "" then
+        local ok, failure = pcall(term.setGraphicsMode, 2)
+        if not ok then error(failure, 0) end
+        configurePalette()
+        invalidateRenderStyle()
+        modal = false
+        return
+    end
+    local x = tonumber(xText)
     write("Z coordinate: ")
     local z = tonumber(read())
     write("Altitude (optional): ")
@@ -1663,6 +1865,26 @@ local function waypointEditor()
     configurePalette()
     invalidateRenderStyle()
     modal = false
+end
+
+local function performNavAction(action)
+    if action == "zoom_in" then
+        changeZoom(1)
+    elseif action == "zoom_out" then
+        changeZoom(-1)
+    elseif action == "waypoint" then
+        waypointEditor()
+    elseif action == "next" then
+        if activeWaypoint < #waypoints then
+            activeWaypoint = activeWaypoint + 1
+            scanPlanSignature = nil
+            saveRoute()
+        end
+    elseif action == "delete" then
+        removeWaypoint(activeWaypoint)
+    elseif action == "home" then
+        returnHomeView()
+    end
 end
 
 local function inputLoop()
@@ -1691,11 +1913,11 @@ local function inputLoop()
             elseif character == "w" then
                 waypointEditor()
             elseif character == "n" then
-                if activeWaypoint < #waypoints then
-                    activeWaypoint = activeWaypoint + 1
-                    scanPlanSignature = nil
-                    saveRoute()
-                end
+                performNavAction("next")
+            elseif character == "x" then
+                performNavAction("delete")
+            elseif character == "b" then
+                performNavAction("home")
             elseif character == "h" then
                 calibrateHeading()
             elseif character == "q" then
@@ -1716,14 +1938,30 @@ local function inputLoop()
             elseif key == keys.right then pan(1, 0)
             elseif key == keys.up then pan(0, -1)
             elseif key == keys.down then pan(0, 1)
-            elseif key == keys.space then follow = true
+            elseif key == keys.space or key == keys.escape then
+                returnHomeView()
             end
         elseif eventName == "mouse_scroll" then
+            inspectMapPoint(event[3], event[4])
             changeZoom(event[2] < 0 and 1 or -1)
+        elseif eventName == "mouse_drag" and info then
+            inspectMapPoint(event[3], event[4])
         elseif eventName == "mouse_click" and info then
             local _, button, mouseX, mouseY = table.unpack(event)
             local display = lastDisplayMap
-            if display
+            local handled = false
+            if display and display.buttons then
+                for _, uiButton in ipairs(display.buttons) do
+                    if mouseX >= uiButton.x1 and mouseX <= uiButton.x2
+                        and mouseY >= uiButton.y1 and mouseY <= uiButton.y2 then
+                        performNavAction(uiButton.action)
+                        handled = true
+                        break
+                    end
+                end
+            end
+            if not handled then inspectMapPoint(mouseX, mouseY) end
+            if not handled and display
                 and mouseY >= display.mapTop
                 and mouseY < display.mapTop + display.mapHeight then
                 if button == 1 then
@@ -1734,6 +1972,20 @@ local function inputLoop()
                         + (mouseY - display.mapTop - display.centerY)
                             / display.pixelsPerBlock
                     addWaypoint(worldX, worldZ, nil)
+                elseif button == 2 then
+                    local waypointIndex = waypointAtPointer(
+                        mouseX, mouseY, display)
+                    if waypointIndex then
+                        removeWaypoint(waypointIndex)
+                    else
+                        viewX = display.mapViewX
+                            + (mouseX - display.centerX)
+                                / display.pixelsPerBlock
+                        viewZ = display.mapViewZ
+                            + (mouseY - display.mapTop - display.centerY)
+                                / display.pixelsPerBlock
+                        follow = false
+                    end
                 else
                     viewX = display.mapViewX
                         + (mouseX - display.centerX)
@@ -1750,6 +2002,7 @@ end
 
 local function main()
     math.randomseed(atlas.now() + os.getComputerID())
+    restoreTextPalette()
     atlas.writeTable(NAV_CONFIG_PATH, navConfig)
     local wireless = atlas.openWirelessRednet()
     serverId, serverInfo = chooseStation(#wireless > 0)
@@ -1785,6 +2038,7 @@ end
 local ok, failure = xpcall(main, debug.traceback)
 pcall(term.setFrozen, false)
 pcall(term.setGraphicsMode, false)
+restoreTextPalette()
 if cacheDirty then pcall(atlas.writeTable, CACHE_META_PATH, cacheIndex) end
 pcall(saveRoute)
 term.setBackgroundColor(colors.black)

@@ -3,8 +3,8 @@ package dev.terrainsurveyor;
 import dan200.computercraft.api.peripheral.PeripheralCapability;
 import dev.terrainsurveyor.block.TerrainSurveyorBlock;
 import dev.terrainsurveyor.block.entity.TerrainSurveyorBlockEntity;
+import dev.terrainsurveyor.item.TerrainSurveyorItem;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
@@ -33,8 +33,9 @@ public final class TerrainSurveyorMod {
             BLOCKS.register("terrain_surveyor", () -> new TerrainSurveyorBlock(
                     BlockBehaviour.Properties.ofFullCopy(Blocks.ACACIA_BUTTON).noOcclusion()));
 
-    public static final DeferredItem<BlockItem> TERRAIN_SURVEYOR_ITEM =
-            ITEMS.registerSimpleBlockItem("terrain_surveyor", TERRAIN_SURVEYOR);
+    public static final DeferredItem<TerrainSurveyorItem> TERRAIN_SURVEYOR_ITEM =
+            ITEMS.register("terrain_surveyor", () -> new TerrainSurveyorItem(
+                    TERRAIN_SURVEYOR.get(), new Item.Properties()));
 
     public static final DeferredItem<Item> INCOMPLETE_TERRAIN_IMAGING_CORE =
             ITEMS.registerSimpleItem("incomplete_terrain_imaging_core");
