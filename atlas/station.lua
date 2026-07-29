@@ -7,6 +7,7 @@ local DRIVE_RESCAN_SECONDS = 1
 local UI_REFRESH_SECONDS = 0.10
 local TRAFFIC_STALE_MS = 5000
 local TRAFFIC_REMOVE_MS = 15000
+local MAX_BULK_REQUEST_TILES = 16
 
 local config = atlas.readTable(CONFIG_PATH) or {}
 config.name = config.name or ("ATLAS-" .. os.getComputerID())
@@ -550,7 +551,11 @@ local function stationInfo()
         volumes = tableCount(volumes),
         capacity = capacity,
         free = free,
-        aircraft = tableCount(aircraft)
+        aircraft = tableCount(aircraft),
+        capabilities = {
+            bulkTiles = true,
+            maxBulkTiles = MAX_BULK_REQUEST_TILES
+        }
     }
 end
 
@@ -632,10 +637,51 @@ local function handleMessage(sender, message)
             message.dimension, message.chunkX, message.chunkZ)
         if tile then
             stats.downloads = stats.downloads + 1
-            atlas.reply(sender, message, "tile_data", { tile = tile })
-        else
+            if message.checksum == tile.checksum then
+                atlas.reply(sender, message, "tile_current")
+            else
+                atlas.reply(sender, message, "tile_data", { tile = tile })
+            end
+        elseif reason == "missing" then
             atlas.reply(sender, message, "tile_missing", { reason = reason })
+        else
+            atlas.reply(sender, message, "tile_unavailable", {
+                reason = reason
+            })
         end
+    elseif message.op == "get_tiles" and type(message.tiles) == "table" then
+        local items = {}
+        local count = math.min(#message.tiles, MAX_BULK_REQUEST_TILES)
+        for index = 1, count do
+            local request = message.tiles[index]
+            if type(request) == "table"
+                and type(request.dimension) == "string"
+                and type(request.chunkX) == "number"
+                and type(request.chunkZ) == "number" then
+                local tile, reason = loadIndexedTile(
+                    request.dimension, request.chunkX, request.chunkZ)
+                local item = {
+                    dimension = request.dimension,
+                    chunkX = request.chunkX,
+                    chunkZ = request.chunkZ
+                }
+                if tile then
+                    if request.checksum == tile.checksum then
+                        item.status = "current"
+                    else
+                        item.status = "data"
+                        item.tile = tile
+                        stats.downloads = stats.downloads + 1
+                    end
+                else
+                    item.status = reason == "missing"
+                        and "missing" or "unavailable"
+                    item.reason = reason
+                end
+                items[#items + 1] = item
+            end
+        end
+        atlas.reply(sender, message, "tiles_data", { items = items })
     elseif message.op == "heartbeat" then
         aircraft[sender] = {
             callsign = message.callsign or ("AC-" .. sender),

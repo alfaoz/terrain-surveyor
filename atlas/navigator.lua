@@ -11,11 +11,11 @@ local atlas = dofile(LIBRARY)
 -- One Minecraft tick: 20 visual/position updates per second.
 local UPDATE_SECONDS = 0.05
 local SCANS_PER_POLL = 4
-local TILE_REFRESH_MS = 120000
 local RETRY_MS = 1500
 local NETWORK_TICK_SECONDS = 0.05
 local HEARTBEAT_MS = 1000
 local TRAFFIC_MS = 1000
+local STATION_INFO_MS = 2000
 local NETWORK_TIMEOUT_MS = 3000
 local NETWORK_MISS_MS = 30000
 local CACHE_META_PATH = "/atlas/cache/index.dat"
@@ -25,6 +25,14 @@ local ROUTE_PATH = "/atlas/route.dat"
 local MAP_BUILD_ROWS_PER_YIELD = 12
 local MAP_BUILD_EVENT = "terrain_map_build"
 local MAP_BUILD_STEP_EVENT = "terrain_map_build_step"
+local MAX_DOWNLOAD_QUEUE = 512
+local VIEWPORT_DOWNLOADS_PER_REFRESH = 64
+local VIEWPORT_INSPECTIONS_PER_REFRESH = 512
+-- Tuned against ATLAS Link Speedtest v2: 120 KB reliable payloads and
+-- 4,329-byte real terrain tiles. Fourteen tiles stay below the 84 KB
+-- recommended response budget, with three requests in flight.
+local DOWNLOAD_BATCH_SIZE = 14
+local MAX_IN_FLIGHT_DOWNLOADS = 3
 local HEADER_HEIGHT = 15
 local FOOTER_HEIGHT = 22
 local CONTOUR_INTERVAL = 10
@@ -85,6 +93,12 @@ for index = 0, 255 do BYTE[index] = string.char(index) end
 
 local function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, value))
+end
+
+local function tableCount(value)
+    local count = 0
+    for _ in pairs(value) do count = count + 1 end
+    return count
 end
 
 local function lerp(a, b, amount)
@@ -244,7 +258,16 @@ local function findSurveyor()
 end
 
 local navConfig = atlas.readTable(NAV_CONFIG_PATH) or {}
-navConfig.callsign = navConfig.callsign or ("AC-" .. os.getComputerID())
+local function validCallsign(value)
+    return type(value) == "string"
+        and value:upper():match("^[A-Z][A-Z]%-%d%d$") ~= nil
+end
+
+if validCallsign(navConfig.callsign) then
+    navConfig.callsign = navConfig.callsign:upper()
+else
+    navConfig.callsign = ("AC-%02d"):format(os.getComputerID() % 100)
+end
 navConfig.writeKey = navConfig.writeKey or ""
 navConfig.lastServer = navConfig.lastServer or ""
 navConfig.headingOffset = tonumber(navConfig.headingOffset) or 0
@@ -290,6 +313,8 @@ local uploadQueue = {}
 local uploadRetry = {}
 local downloadQueue = {}
 local networkMissUntil = {}
+local serverVerifiedAt = {}
+local forceSurvey = {}
 local traffic = {}
 local motion = {
     speed = 0,
@@ -303,6 +328,7 @@ local scanPlanSignature
 local modal = false
 local lastDisplayMap
 local pointerDetails
+local viewportPrefetchState
 
 local function saveRoute()
     activeWaypoint = math.max(1, math.min(
@@ -447,9 +473,19 @@ local function loadLocalRaw(dimension, chunkX, chunkZ)
     local entry = cacheIndex.tiles[key]
     local path = entry and entry.path
         or localCachePath(dimension, chunkX, chunkZ)
-    if not fs.exists(path) then return nil end
+    if not fs.exists(path) then
+        if entry then
+            cacheIndex.tiles[key] = nil
+            cacheDirty = true
+        end
+        return nil
+    end
     local raw = atlas.loadTile(path)
-    if not raw then return nil end
+    if not raw then
+        cacheIndex.tiles[key] = nil
+        cacheDirty = true
+        return nil
+    end
     cacheIndex.tiles[key] = entry or {
         path = path,
         checksum = raw.checksum,
@@ -464,6 +500,11 @@ end
 local function queueUpload(raw)
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
     uploadQueue[key] = atlas.copyTile(raw)
+    local entry = cacheIndex.tiles[key]
+    if entry then
+        entry.unsynced = true
+        cacheDirty = true
+    end
     local retry = uploadRetry[key]
     if retry and retry.checksum ~= raw.checksum then uploadRetry[key] = nil end
 end
@@ -477,24 +518,43 @@ local function markSynced(raw)
     end
     uploadQueue[key] = nil
     uploadRetry[key] = nil
+    networkMissUntil[key] = nil
+    serverVerifiedAt[key] = nowMs()
 end
 
-local function queueDownload(dimension, chunkX, chunkZ, priority)
-    if not serverId then return end
+local function queueDownload(
+        dimension, chunkX, chunkZ, priority, verifyExisting)
+    if not serverId then return false end
     local key = tileKey(dimension, chunkX, chunkZ)
-    if tiles[key] or pendingKeys[key]
-        or nowMs() < (networkMissUntil[key] or 0) then return end
+    if pendingKeys[key] then return false end
     local cached = cacheIndex.tiles[key]
-    if cached and fs.exists(cached.path) then return end
+    local hasCached = cached and fs.exists(cached.path)
+    local localTile = tiles[key]
+    local knownChecksum = localTile and localTile.checksum
+        or hasCached and cached.checksum
+
+    if localTile or hasCached then
+        if not verifyExisting or cached and cached.unsynced
+            or serverVerifiedAt[key] then return false end
+    elseif nowMs() < (networkMissUntil[key] or 0) then
+        return false
+    end
+
     local existing = downloadQueue[key]
     if not existing or priority < existing.priority then
+        if not existing and tableCount(downloadQueue) >= MAX_DOWNLOAD_QUEUE then
+            return false
+        end
         downloadQueue[key] = {
             dimension = dimension,
             chunkX = chunkX,
             chunkZ = chunkZ,
-            priority = priority
+            priority = priority,
+            knownChecksum = knownChecksum
         }
+        return not existing
     end
+    return false
 end
 
 local function discoverStations()
@@ -556,8 +616,11 @@ local function chooseStation(hasWireless)
         term.setCursorPos(2, 4)
         term.setTextColor(colors.lightGray)
         term.write("SELECT A MAP NETWORK")
+        term.setCursorPos(2, 5)
+        term.setTextColor(colors.white)
+        term.write("VEHICLE " .. navConfig.callsign .. "  [C] CHANGE CODE")
 
-        local firstY = 6
+        local firstY = 7
         if #stations == 0 then
             term.setCursorPos(2, firstY)
             term.setTextColor(colors.gray)
@@ -577,6 +640,11 @@ local function chooseStation(hasWireless)
                 term.setBackgroundColor(colors.black)
             end
         end
+
+        term.setCursorPos(2, height - 2)
+        term.setBackgroundColor(colors.blue)
+        term.setTextColor(colors.white)
+        term.write(" CHANGE CODE ")
 
         term.setCursorPos(2, height - 1)
         term.setBackgroundColor(colors.gray)
@@ -602,12 +670,27 @@ local function chooseStation(hasWireless)
                 navConfig.lastServer = station.name or ""
                 atlas.writeTable(NAV_CONFIG_PATH, navConfig)
                 return station.id, station
+            elseif event[2] == keys.escape then
+                return serverId, serverInfo, "cancel"
             end
         elseif event[1] == "mouse_click" then
             local _, _, x, y = table.unpack(event, 1, event.n)
             local row = y - firstY + 1
             if row >= 1 and row <= #stations then
                 selected = row
+            elseif y == height - 2 and x >= 2 and x <= 14 then
+                term.setBackgroundColor(colors.black)
+                term.setTextColor(colors.white)
+                term.clear()
+                term.setCursorPos(2, 2)
+                print("VEHICLE CODE")
+                term.setCursorPos(2, 4)
+                write("Enter XX-NN (blank cancels): ")
+                local value = read():upper()
+                if validCallsign(value) then
+                    navConfig.callsign = value
+                    atlas.writeTable(NAV_CONFIG_PATH, navConfig)
+                end
             elseif y == height - 1 and x >= 2 and x <= 10
                 and stations[selected] then
                 local station = stations[selected]
@@ -622,7 +705,20 @@ local function chooseStation(hasWireless)
             end
         elseif event[1] == "char" then
             local character = event[2]:lower()
-            if character == "r" then
+            if character == "c" then
+                term.setBackgroundColor(colors.black)
+                term.setTextColor(colors.white)
+                term.clear()
+                term.setCursorPos(2, 2)
+                print("VEHICLE CODE")
+                term.setCursorPos(2, 4)
+                write("Enter XX-NN (blank cancels): ")
+                local value = read():upper()
+                if validCallsign(value) then
+                    navConfig.callsign = value
+                    atlas.writeTable(NAV_CONFIG_PATH, navConfig)
+                end
+            elseif character == "r" then
                 stations = discoverStations()
                 selected = #stations > 0 and 1 or 0
             elseif character == "o" then
@@ -719,16 +815,28 @@ local function installRawTile(raw, source)
     end
     tiles[key] = decoded
     retryAfter[key] = nil
+    networkMissUntil[key] = nil
+    if source == "network" then serverVerifiedAt[key] = nowMs() end
     if not previous then tileCount = tileCount + 1 end
     invalidateTileDependencies(decoded.dimension, decoded.chunkX, decoded.chunkZ)
 
     if source == "survey" then
+        forceSurvey[key] = nil
         saveLocalRaw(raw, true)
         queueUpload(raw)
     elseif source == "network" then
         saveLocalRaw(raw, false)
     end
     return decoded
+end
+
+local function loadCachedTileIfPresent(dimension, chunkX, chunkZ)
+    local key = tileKey(dimension, chunkX, chunkZ)
+    if tiles[key] then return false end
+    local raw = loadLocalRaw(dimension, chunkX, chunkZ)
+    if not raw then return false end
+    installRawTile(raw, "disk")
+    return true
 end
 
 local function scanDirection()
@@ -812,8 +920,7 @@ local function chooseScan(infoValue)
     end
 
     local currentTime = nowMs()
-    local staleChoice
-    local staleAge = -1
+    local waitingForSharedMap = false
 
     for _, offset in ipairs(scanOffsets) do
         local chunkX = infoValue.chunkX + offset.dx
@@ -821,8 +928,9 @@ local function chooseScan(infoValue)
         local key = tileKey(infoValue.dimension, chunkX, chunkZ)
         local tile = tiles[key]
         local retryTime = retryAfter[key] or 0
+        local forced = forceSurvey[key]
 
-        if not tile then
+        if not tile and not forced then
             local cached = loadLocalRaw(
                 infoValue.dimension, chunkX, chunkZ)
             if cached then
@@ -831,19 +939,23 @@ local function chooseScan(infoValue)
         end
 
         if not tile and currentTime >= retryTime then
-            return offset, key
-        end
+            if forced then return offset, key end
 
-        if tile then
-            local age = currentTime - tile.scannedAt
-            if age >= TILE_REFRESH_MS and age > staleAge then
-                staleChoice = { offset = offset, key = key }
-                staleAge = age
+            local stationConfirmedMissing =
+                currentTime < (networkMissUntil[key] or 0)
+            if serverId and linkStatus ~= "LOST"
+                and not stationConfirmedMissing then
+                queueDownload(
+                    infoValue.dimension, chunkX, chunkZ,
+                    -10000 + offset.score)
+                waitingForSharedMap = true
+            else
+                return offset, key
             end
         end
     end
 
-    if staleChoice then return staleChoice.offset, staleChoice.key end
+    return nil, nil, waitingForSharedMap
 end
 
 local function scanOne(infoValue)
@@ -852,9 +964,10 @@ local function scanOne(infoValue)
         return false
     end
 
-    local offset, key = chooseScan(infoValue)
+    local offset, key, waitingForSharedMap = chooseScan(infoValue)
     if not offset then
-        scanStatus = "CURRENT"
+        scanStatus = waitingForSharedMap
+            and "SYNCING SHARED MAP" or "CURRENT"
         return false
     end
 
@@ -1306,16 +1419,24 @@ local function render()
             waypoint.name or ("WP" .. activeWaypoint),
             math.floor(distance + 0.5), math.floor(eta + 0.5), motion.speed)
         or ("NO ACTIVE ROUTE SPD:%.1f"):format(motion.speed)
-    drawText(2, footerY, fitText(routeLine, width),
-        waypoint and COLOR.text or COLOR.textDim, width, height)
-    local status = ("MAP:%d %s NET:%s ZOOM:%s HDG:%s POLL:%dX"):format(
-        tileCount, scanStatus, linkStatus, zoomLabel,
-        motion.headingSource, SCANS_PER_POLL)
     local detailActive = pointerDetails
         and nowMs() - pointerDetails.at < 5000
+    drawText(2, footerY,
+        fitText(detailActive and pointerDetails.text or routeLine, width),
+        (detailActive or waypoint) and COLOR.text or COLOR.textDim,
+        width, height)
+    local stationTiles = serverInfo and serverInfo.tiles or "?"
+    local status = (
+        "LOCAL:%d SERVER:%s UP:%d DOWN:%d RETRY:%d NET:%s POLL:%dX"):format(
+        tileCount, tostring(stationTiles),
+        tableCount(uploadQueue), tableCount(downloadQueue),
+        tableCount(uploadRetry), linkStatus, SCANS_PER_POLL)
+    local scannerStatus = "SENSOR " .. scanStatus
+    local scannerX = math.max(2, width - #scannerStatus * 4 - 1)
     drawText(2, footerY + 7,
-        fitText(detailActive and pointerDetails.text or status, width),
-        detailActive and COLOR.text or COLOR.textDim, width, height)
+        fitText(status, scannerX - 4), COLOR.textDim, width, height)
+    drawText(scannerX, footerY + 7,
+        scannerStatus, COLOR.textDim, width, height)
     local toolbarY = footerY + 13
     local toolbarButtons = {}
     local toolbarX = 2
@@ -1329,6 +1450,8 @@ local function render()
         toolbarButtons, toolbarX, toolbarY, "NEXT", "next", width, height)
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "DEL", "delete", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "CTR", "center", width, height)
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "HOME", "home", width, height)
     drawText(toolbarX + 2, footerY + 14,
@@ -1437,6 +1560,11 @@ local function sendPending(operation, payload, pending)
     pending.requestId = requestId
     pendingNetwork[requestId] = pending
     if pending.key then pendingKeys[pending.key] = requestId end
+    if pending.keys then
+        for _, key in ipairs(pending.keys) do
+            pendingKeys[key] = requestId
+        end
+    end
     return true
 end
 
@@ -1460,11 +1588,30 @@ local function nextQueuedDownload()
     local choice
     for key, request in pairs(downloadQueue) do
         if not pendingKeys[key]
+            and nowMs() >= (request.notBefore or 0)
             and (not choice or request.priority < choice.priority) then
             choiceKey, choice = key, request
         end
     end
     return choiceKey, choice
+end
+
+local function nextQueuedDownloads(limit)
+    local choices = {}
+    for key, request in pairs(downloadQueue) do
+        if not pendingKeys[key]
+            and nowMs() >= (request.notBefore or 0) then
+            choices[#choices + 1] = { key = key, request = request }
+        end
+    end
+    table.sort(choices, function(a, b)
+        if a.request.priority == b.request.priority then
+            return a.key < b.key
+        end
+        return a.request.priority < b.request.priority
+    end)
+    while #choices > limit do table.remove(choices) end
+    return choices
 end
 
 local function processNetworkQueue()
@@ -1488,12 +1635,53 @@ local function processNetworkQueue()
         end
     end
 
+    local inFlightDownloads = 0
+    for _, pending in pairs(pendingNetwork) do
+        if pending.type == "download"
+            or pending.type == "download_batch" then
+            inFlightDownloads = inFlightDownloads + 1
+        end
+    end
+    if inFlightDownloads >= MAX_IN_FLIGHT_DOWNLOADS then return end
+
+    local bulkSupported = serverInfo
+        and type(serverInfo.capabilities) == "table"
+        and serverInfo.capabilities.bulkTiles
+    if bulkSupported then
+        local choices = nextQueuedDownloads(DOWNLOAD_BATCH_SIZE)
+        if #choices > 0 then
+            local requests = {}
+            local requestByKey = {}
+            local keys = {}
+            for _, choice in ipairs(choices) do
+                local request = choice.request
+                requests[#requests + 1] = {
+                    dimension = request.dimension,
+                    chunkX = request.chunkX,
+                    chunkZ = request.chunkZ,
+                    checksum = request.knownChecksum
+                }
+                requestByKey[choice.key] = request
+                keys[#keys + 1] = choice.key
+            end
+            sendPending("get_tiles", {
+                tiles = requests
+            }, {
+                type = "download_batch",
+                keys = keys,
+                requests = requestByKey
+            })
+            return
+        end
+    end
+
     local key, request = nextQueuedDownload()
     if request then
         sendPending("get_tile", {
             dimension = request.dimension,
             chunkX = request.chunkX,
-            chunkZ = request.chunkZ
+            chunkZ = request.chunkZ,
+            checksum = request.knownChecksum
         }, {
             type = "download",
             key = key,
@@ -1506,6 +1694,13 @@ local function clearPending(request)
     pendingNetwork[request.requestId] = nil
     if request.key and pendingKeys[request.key] == request.requestId then
         pendingKeys[request.key] = nil
+    end
+    if request.keys then
+        for _, key in ipairs(request.keys) do
+            if pendingKeys[key] == request.requestId then
+                pendingKeys[key] = nil
+            end
+        end
     end
 end
 
@@ -1558,9 +1753,66 @@ local function handleNetworkMessage(sender, message)
         if message.op == "tile_data" and message.tile then
             local ok = pcall(installRawTile, message.tile, "network")
             if ok then downloadQueue[pending.key] = nil end
+        elseif message.op == "tile_current" then
+            downloadQueue[pending.key] = nil
+            serverVerifiedAt[pending.key] = nowMs()
         elseif message.op == "tile_missing" then
             downloadQueue[pending.key] = nil
-            networkMissUntil[pending.key] = nowMs() + NETWORK_MISS_MS
+            local request = pending.request
+            local localTile = tiles[pending.key]
+            local raw = localTile and localTile.raw
+                or loadLocalRaw(
+                    request.dimension, request.chunkX, request.chunkZ)
+            if raw then
+                queueUpload(raw)
+            else
+                networkMissUntil[pending.key] =
+                    nowMs() + NETWORK_MISS_MS
+            end
+        elseif message.op == "tile_unavailable" then
+            pending.request.notBefore = nowMs() + 3000
+            scanStatus = "SHARED TILE OFFLINE"
+        end
+    elseif pending.type == "download_batch"
+        and message.op == "tiles_data"
+        and type(message.items) == "table" then
+        for _, item in ipairs(message.items) do
+            if type(item) == "table"
+                and type(item.dimension) == "string"
+                and type(item.chunkX) == "number"
+                and type(item.chunkZ) == "number" then
+                local key = tileKey(
+                    item.dimension, item.chunkX, item.chunkZ)
+                if pending.requests[key] then
+                    if item.status == "data" and item.tile then
+                        local ok = pcall(
+                            installRawTile, item.tile, "network")
+                        if ok then downloadQueue[key] = nil end
+                    elseif item.status == "current" then
+                        downloadQueue[key] = nil
+                        serverVerifiedAt[key] = nowMs()
+                    elseif item.status == "missing" then
+                        downloadQueue[key] = nil
+                        local request = pending.requests[key]
+                        local localTile = tiles[key]
+                        local raw = localTile and localTile.raw
+                            or loadLocalRaw(
+                                request.dimension,
+                                request.chunkX,
+                                request.chunkZ)
+                        if raw then
+                            queueUpload(raw)
+                        else
+                            networkMissUntil[key] =
+                                nowMs() + NETWORK_MISS_MS
+                        end
+                    elseif item.status == "unavailable" then
+                        local request = pending.requests[key]
+                        request.notBefore = nowMs() + 3000
+                        scanStatus = "SHARED TILE OFFLINE"
+                    end
+                end
+            end
         end
     end
 end
@@ -1618,6 +1870,105 @@ local function queueCorridor(
     end
 end
 
+local function queueVisibleMap()
+    local display = lastDisplayMap
+    if not display or not info then return end
+
+    local minimumWorldX = display.mapViewX
+        - display.centerX / display.pixelsPerBlock
+    local maximumWorldX = display.mapViewX
+        + (display.width - 1 - display.centerX)
+            / display.pixelsPerBlock
+    local minimumWorldZ = display.mapViewZ
+        - display.centerY / display.pixelsPerBlock
+    local maximumWorldZ = display.mapViewZ
+        + (display.mapHeight - 1 - display.centerY)
+            / display.pixelsPerBlock
+    local minimumChunkX = math.floor(minimumWorldX / 16)
+    local maximumChunkX = math.floor(maximumWorldX / 16)
+    local minimumChunkZ = math.floor(minimumWorldZ / 16)
+    local maximumChunkZ = math.floor(maximumWorldZ / 16)
+    local centerChunkX = math.floor(display.mapViewX / 16)
+    local centerChunkZ = math.floor(display.mapViewZ / 16)
+    local maximumRadius = math.max(
+        math.abs(minimumChunkX - centerChunkX),
+        math.abs(maximumChunkX - centerChunkX),
+        math.abs(minimumChunkZ - centerChunkZ),
+        math.abs(maximumChunkZ - centerChunkZ))
+
+    local signature = table.concat({
+        info.dimension,
+        minimumChunkX, maximumChunkX,
+        minimumChunkZ, maximumChunkZ,
+        centerChunkX, centerChunkZ
+    }, ":")
+    if not viewportPrefetchState
+        or viewportPrefetchState.signature ~= signature then
+        viewportPrefetchState = {
+            signature = signature,
+            radius = 0,
+            edge = 0,
+            offset = 0
+        }
+    end
+
+    local function nextOffset()
+        local state = viewportPrefetchState
+        if state.radius == 0 then
+            state.radius = 1
+            return 0, 0, 0
+        end
+
+        local radius = state.radius
+        local edge = state.edge
+        local offset = state.offset
+        local dx
+        local dz
+        if edge == 0 then
+            dx, dz = -radius + offset, -radius
+        elseif edge == 1 then
+            dx, dz = radius, -radius + offset
+        elseif edge == 2 then
+            dx, dz = radius - offset, radius
+        else
+            dx, dz = -radius, radius - offset
+        end
+
+        state.offset = state.offset + 1
+        if state.offset >= radius * 2 then
+            state.offset = 0
+            state.edge = state.edge + 1
+            if state.edge >= 4 then
+                state.edge = 0
+                state.radius = state.radius + 1
+                if state.radius > maximumRadius then
+                    state.radius = 0
+                end
+            end
+        end
+        return dx, dz, radius
+    end
+
+    local queued = 0
+    for _ = 1, VIEWPORT_INSPECTIONS_PER_REFRESH do
+        local dx, dz, radius = nextOffset()
+        local chunkX = centerChunkX + dx
+        local chunkZ = centerChunkZ + dz
+        if chunkX >= minimumChunkX and chunkX <= maximumChunkX
+            and chunkZ >= minimumChunkZ and chunkZ <= maximumChunkZ then
+            local loaded = loadCachedTileIfPresent(
+                info.dimension, chunkX, chunkZ)
+            local requested = queueDownload(
+                info.dimension, chunkX, chunkZ,
+                60 + radius, true)
+            if loaded or requested then
+                queued = queued + 1
+                if queued >= VIEWPORT_DOWNLOADS_PER_REFRESH then return end
+            end
+        end
+    end
+end
+
 local function refreshPrefetch()
     if not info or not serverId then return end
     local chunkX = math.floor(info.x / 16)
@@ -1627,8 +1978,11 @@ local function refreshPrefetch()
         for dx = -4, 4 do
             local distance = dx * dx + dz * dz
             if distance <= 16 then
+                loadCachedTileIfPresent(
+                    info.dimension, chunkX + dx, chunkZ + dz)
                 queueDownload(
-                    info.dimension, chunkX + dx, chunkZ + dz, distance)
+                    info.dimension, chunkX + dx, chunkZ + dz,
+                    distance, true)
             end
         end
     end
@@ -1657,6 +2011,7 @@ local function refreshPrefetch()
             100 + (index - activeWaypoint) * 300)
         fromX, fromZ = toX, toZ
     end
+    queueVisibleMap()
 end
 
 local function evictCacheIfNeeded()
@@ -1689,6 +2044,7 @@ local function networkLoop()
     local timer = os.startTimer(NETWORK_TICK_SECONDS)
     local lastHeartbeat = 0
     local lastTraffic = 0
+    local lastStationInfo = 0
     while running do
         local event = table.pack(os.pullEventRaw())
         if event[1] == "terminate" then
@@ -1708,6 +2064,11 @@ local function networkLoop()
             if currentTime - lastTraffic >= TRAFFIC_MS then
                 requestTraffic()
                 lastTraffic = currentTime
+            end
+            if serverId
+                and currentTime - lastStationInfo >= STATION_INFO_MS then
+                atlas.send(serverId, "station_info", {})
+                lastStationInfo = currentTime
             end
             if serverId and currentTime - lastServerSeen > 5000 then
                 linkStatus = "LOST"
@@ -1867,6 +2228,53 @@ local function waypointEditor()
     modal = false
 end
 
+local function openHomeMenu()
+    modal = true
+    pcall(term.setFrozen, false)
+    pcall(term.setGraphicsMode, false)
+    restoreTextPalette()
+
+    local wireless = atlas.openWirelessRednet()
+    local previousServerId = serverId
+    local previousServerInfo = serverInfo
+    local selectedId
+    local selectedInfo
+    local action
+    if #wireless > 0 then
+        selectedId, selectedInfo, action = chooseStation(true)
+    else
+        action = "cancel"
+        scanStatus = "NO WIRELESS MODEM"
+    end
+
+    if action ~= "cancel" then
+        pendingNetwork = {}
+        pendingKeys = {}
+        networkMissUntil = {}
+        serverVerifiedAt = {}
+        serverId = selectedId
+        serverInfo = selectedInfo
+        if serverId then
+            linkStatus = "ONLINE"
+            lastServerSeen = nowMs()
+            navConfig.lastServer = selectedInfo and selectedInfo.name or ""
+        else
+            linkStatus = "OFFLINE"
+            navConfig.lastServer = ""
+        end
+        atlas.writeTable(NAV_CONFIG_PATH, navConfig)
+    else
+        serverId = previousServerId
+        serverInfo = previousServerInfo
+    end
+
+    local ok, failure = pcall(term.setGraphicsMode, 2)
+    if not ok then error(failure, 0) end
+    configurePalette()
+    invalidateRenderStyle()
+    modal = false
+end
+
 local function performNavAction(action)
     if action == "zoom_in" then
         changeZoom(1)
@@ -1882,8 +2290,10 @@ local function performNavAction(action)
         end
     elseif action == "delete" then
         removeWaypoint(activeWaypoint)
-    elseif action == "home" then
+    elseif action == "center" then
         returnHomeView()
+    elseif action == "home" then
+        openHomeMenu()
     end
 end
 
@@ -1917,7 +2327,7 @@ local function inputLoop()
             elseif character == "x" then
                 performNavAction("delete")
             elseif character == "b" then
-                performNavAction("home")
+                performNavAction("center")
             elseif character == "h" then
                 calibrateHeading()
             elseif character == "q" then
@@ -1925,6 +2335,9 @@ local function inputLoop()
                 return
             elseif character == "r" and info then
                 local key = tileKey(info.dimension, info.chunkX, info.chunkZ)
+                forceSurvey[key] = true
+                downloadQueue[key] = nil
+                networkMissUntil[key] = nil
                 if tiles[key] then
                     tiles[key] = nil
                     tileCount = math.max(0, tileCount - 1)

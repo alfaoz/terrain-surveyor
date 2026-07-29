@@ -192,7 +192,9 @@ Controls:
 - Click, scroll, or drag over the map: show surface, clearance, and fluid
   details for that map point
 - Arrow keys: pan and leave follow mode
-- Space, Escape, `B`, or the `HOME` button: recenter and resume follow mode
+- Space, Escape, `B`, or the `CTR` button: recenter and resume follow mode
+- `HOME`: return to the network menu without closing the navigator
+- `C` on the Home screen: change the vehicle code (`XX-NN`, such as `AC-01`)
 - `G`: toggle chunk grid
 - `C`: toggle 10-block contour lines
 - `O`: toggle clearance-obstacle stippling
@@ -206,19 +208,42 @@ Controls:
 - `Q`: close and return to text mode
 
 The zoom levels range from four blocks per pixel to eight pixels per block.
-Unknown tiles remain dark until the aircraft loads them and the surveyor
-finishes scanning them.
+Unknown tiles remain dark until the aircraft obtains them. The station is the
+shared source of truth: the navigator first loads its onboard cache, bulk-checks
+visible tile checksums against the station, downloads shared tiles contributed
+by other aircraft, and only surveys after the station explicitly reports that a
+tile is missing. Known tiles are never automatically rescanned; `R` is the
+explicit resurvey command.
 
 The navigator polls position and redraws at the Minecraft tick rate. Each poll
-can scan up to four queued chunks, while its network queue is serviced every
-tick. The station storage screen provides clickable maintenance controls and
-expanded details for the selected disk. If only a wired modem is present, the
-station remains usable in `WIRED` mode and automatically enables wireless
-service when an Ender Modem is attached.
+can scan up to four station-confirmed missing chunks. Network downloads use
+checksum-aware batches with bounded in-flight requests, and zoomed-out viewport
+prefetch uses an incremental center-out walk so it does not stall the UI by
+examining the entire visible world at once. The station storage screen provides
+clickable maintenance controls and expanded details for the selected disk. If
+only a wired modem is present, the station remains usable in `WIRED` mode and
+automatically enables wireless service when an Ender Modem is attached.
 
 Unsynced terrain remains in the aircraft cache. Deferred, rejected, or timed
 out uploads retry automatically with exponential backoff, capped at 30 seconds,
 so maintenance or temporarily missing station storage cannot lose survey data.
+If a station is missing a tile that remains in an aircraft cache, the navigator
+uploads that cached copy and repairs the shared map.
+
+### ATLAS bandwidth benchmark
+
+[`examples/atlas_bandwidth_test.lua`](examples/atlas_bandwidth_test.lua) runs
+on two modem-equipped computers and measures reliable payload size, latency,
+and throughput in both directions:
+
+```text
+wget run https://gist.githubusercontent.com/alfaoz/1ebe93f01feeb891cc3cd74cff027b4b/raw/a8bd3f2028e3126adb8a2b3a358b13ad56e6a79b/atlas_bandwidth_test.lua server
+wget run https://gist.githubusercontent.com/alfaoz/1ebe93f01feeb891cc3cd74cff027b4b/raw/a8bd3f2028e3126adb8a2b3a358b13ad56e6a79b/atlas_bandwidth_test.lua client
+```
+
+The client writes the detailed result table to `/atlas-bench.txt`. Use its
+suggested safe payload size to tune the tile batch size for a particular
+server/modpack/network.
 
 ## Build
 
