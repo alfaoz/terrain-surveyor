@@ -1,0 +1,61 @@
+{
+  "variants": {
+    "face=ceiling,facing=east": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "x": 180,
+      "y": 270
+    },
+    "face=ceiling,facing=north": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "x": 180,
+      "y": 180
+    },
+    "face=ceiling,facing=south": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "x": 180
+    },
+    "face=ceiling,facing=west": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "x": 180,
+      "y": 90
+    },
+    "face=floor,facing=east": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "y": 90
+    },
+    "face=floor,facing=north": {
+      "model": "terrain_surveyor:block/terrain_surveyor"
+    },
+    "face=floor,facing=south": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "y": 180
+    },
+    "face=floor,facing=west": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "y": 270
+    },
+    "face=wall,facing=east": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "uvlock": true,
+      "x": 90,
+      "y": 90
+    },
+    "face=wall,facing=north": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "uvlock": true,
+      "x": 90
+    },
+    "face=wall,facing=south": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "uvlock": true,
+      "x": 90,
+      "y": 180
+    },
+    "face=wall,facing=west": {
+      "model": "terrain_surveyor:block/terrain_surveyor",
+      "uvlock": true,
+      "x": 90,
+      "y": 270
+    }
+  }
+}

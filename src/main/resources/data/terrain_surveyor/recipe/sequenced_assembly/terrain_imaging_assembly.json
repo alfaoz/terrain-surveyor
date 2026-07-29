@@ -1,0 +1,94 @@
+{
+  "type": "create:sequenced_assembly",
+  "ingredient": {
+    "item": "create:precision_mechanism"
+  },
+  "loops": 3,
+  "results": [
+    {
+      "id": "terrain_surveyor:layered_terrain_imaging_assembly"
+    }
+  ],
+  "sequence": [
+    {
+      "type": "create:deploying",
+      "ingredients": [
+        {
+          "item": "terrain_surveyor:incomplete_terrain_imaging_core"
+        },
+        {
+          "tag": "c:plates/copper"
+        }
+      ],
+      "results": [
+        {
+          "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ]
+    },
+    {
+      "type": "create:deploying",
+      "ingredients": [
+        {
+          "item": "terrain_surveyor:incomplete_terrain_imaging_core"
+        },
+        {
+          "item": "minecraft:amethyst_shard"
+        }
+      ],
+      "results": [
+        {
+          "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ]
+    },
+    {
+      "type": "create:deploying",
+      "ingredients": [
+        {
+          "item": "terrain_surveyor:incomplete_terrain_imaging_core"
+        },
+        {
+          "item": "minecraft:redstone"
+        }
+      ],
+      "results": [
+        {
+          "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ]
+    },
+    {
+      "type": "create:pressing",
+      "ingredients": [
+        {
+          "item": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ],
+      "results": [
+        {
+          "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ]
+    },
+    {
+      "type": "create:deploying",
+      "ingredients": [
+        {
+          "item": "terrain_surveyor:incomplete_terrain_imaging_core"
+        },
+        {
+          "item": "create:polished_rose_quartz"
+        }
+      ],
+      "results": [
+        {
+          "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+        }
+      ]
+    }
+  ],
+  "transitional_item": {
+    "id": "terrain_surveyor:incomplete_terrain_imaging_core"
+  }
+}

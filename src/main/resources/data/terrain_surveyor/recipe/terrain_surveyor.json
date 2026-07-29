@@ -1,0 +1,28 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "redstone",
+  "key": {
+    "B": {
+      "tag": "c:plates/brass"
+    },
+    "C": {
+      "item": "terrain_surveyor:terrain_imaging_core"
+    },
+    "E": {
+      "item": "create:electron_tube"
+    },
+    "M": {
+      "item": "minecraft:compass"
+    }
+  },
+  "pattern": [
+    "BEB",
+    "BCB",
+    "BMB"
+  ],
+  "result": {
+    "count": 1,
+    "id": "terrain_surveyor:terrain_surveyor"
+  },
+  "show_notification": true
+}

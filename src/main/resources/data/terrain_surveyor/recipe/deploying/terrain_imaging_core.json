@@ -1,0 +1,16 @@
+{
+  "type": "create:deploying",
+  "ingredients": [
+    {
+      "item": "terrain_surveyor:layered_terrain_imaging_assembly"
+    },
+    {
+      "item": "ccbr:integrated_circuit"
+    }
+  ],
+  "results": [
+    {
+      "id": "terrain_surveyor:terrain_imaging_core"
+    }
+  ]
+}

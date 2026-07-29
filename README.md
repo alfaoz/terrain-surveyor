@@ -1,0 +1,220 @@
+# Terrain Surveyor
+
+A small, passive CC:Tweaked peripheral for obtaining full-resolution terrain
+height data from a piloted Sable contraption. It is built for NeoForge 1.21.1
+and does not use Advanced Peripherals.
+
+The current block deliberately uses the vanilla Acacia Button model and texture
+as a placeholder. It can be mounted on a floor, wall, or ceiling, has no GUI,
+does not emit redstone, and needs no kinetic power.
+
+## Target versions
+
+- Minecraft 1.21.1
+- NeoForge 21.1.243
+- CC:Tweaked 1.120.0
+- Create 6.0.10
+- Sable 2.0.3 (including Sable Companion 1.6.0)
+- Create: CC Better Recipes 1.2.0
+
+## Survival crafting
+
+The Terrain Imaging Core begins with a Create Precision Mechanism.
+
+The sequenced assembly repeats these five operations three times:
+
+1. Deploy a Copper Sheet.
+2. Deploy an Amethyst Shard.
+3. Deploy Redstone Dust.
+4. Press the assembly.
+5. Deploy Polished Rose Quartz.
+
+This outputs a Layered Terrain Imaging Assembly. A separate, one-off Deployer
+then applies one `ccbr:integrated_circuit` to finish the Terrain Imaging Core.
+
+The final shaped recipe is:
+
+```text
+Brass Sheet | Electron Tube        | Brass Sheet
+Brass Sheet | Terrain Imaging Core | Brass Sheet
+Brass Sheet | Compass              | Brass Sheet
+```
+
+## Peripheral API
+
+Attach the surveyor directly to a CC:Tweaked computer and locate it with:
+
+```lua
+local surveyor = peripheral.find("terrain_surveyor")
+assert(surveyor, "No Terrain Surveyor attached")
+```
+
+### `getInfo()`
+
+Returns the Sable-projected world position, current chunk, and supported
+radius.
+
+### `scanChunk(dx, dz)`
+
+Scans an already-loaded chunk relative to the chunk containing the surveyor.
+Both offsets must be between `-8` and `8`, providing a 17×17-chunk survey
+window centered on the aircraft. Calling the method does not generate, load, or
+force-load chunks, so results are still bounded by the server's loaded-chunk
+distance. There is no peripheral cooldown; the calling CraftOS program controls
+the scan rate.
+
+The scan runs on the Minecraft server thread and returns:
+
+```lua
+{
+  version = 1,
+  dimension = "minecraft:overworld",
+  chunkX = 0,
+  chunkZ = 0,
+  minY = -64,
+  maxY = 319,
+  width = 16,
+  depth = 16,
+  order = "z_major",
+  byteOrder = "big_endian",
+
+  surface = "<512-byte binary string>",
+  clearance = "<512-byte binary string>",
+  fluid = "<512-byte binary string>",
+  flags = "<256-byte binary string>",
+  checksum = "8 hexadecimal CRC-32 digits"
+}
+```
+
+There is one sample for every X/Z block in the chunk. Samples use
+`index = z * 16 + x`, with local X and Z in the range 0–15.
+
+- `surface`: solid surface height after ignoring leaves, glass, fluids, and
+  replaceable vegetation.
+- `clearance`: highest collidable obstacle, including leaves and glass.
+- `fluid`: highest exposed fluid found above the solid surface.
+- `flags`: two fluid-kind bits plus a bit indicating an obstacle above the
+  surface.
+
+Each height is an unsigned, big-endian 16-bit offset from `minY`. `65535`
+means no height was found. Flag bits are:
+
+- bits 0–1: `0` none, `1` water, `2` lava, `3` other fluid
+- bit 2: clearance is higher than surface
+
+Example decoder:
+
+```lua
+local function decodeHeight(tile, field, x, z)
+  local data = tile[field]
+  local sample = z * 16 + x
+  local byteIndex = sample * 2 + 1
+  local encoded = data:byte(byteIndex) * 256 + data:byte(byteIndex + 1)
+  if encoded == 0xffff then return nil end
+  return tile.minY + encoded
+end
+
+local tile = surveyor.scanChunk(0, 0)
+print("surface:", decodeHeight(tile, "surface", 8, 8))
+print("clearance:", decodeHeight(tile, "clearance", 8, 8))
+```
+
+## Block classification
+
+The defaults are datapack tags and can be extended by a modpack:
+
+- `terrain_surveyor:surface_ignored`
+- `terrain_surveyor:clearance_ignored`
+
+This keeps the terrain rules editable without rebuilding the mod. The supplied
+surface tag ignores vanilla leaves, glass blocks and panes, flowers, fluids,
+and replaceable vegetation. Clearance ignores harmless replaceable vegetation
+but still includes collidable transparent obstacles.
+
+## ATLAS
+
+The `atlas/` directory contains the first complete ATLAS application:
+
+- `lib.lua`: shared protocol, terrain-file, capacity, and peripheral helpers.
+- `station.lua`: the home map station, storage-rack controller, and traffic
+  service. Its interface runs entirely on the station computer.
+- `navigator.lua`: the onboard CC: Graphics navigator, persistent cache,
+  waypoints, smart survey scheduler, network prefetch, and live traffic.
+
+ATLAS volumes are ordinary floppy disks attached through any number of wired
+disk drives. The station detects their real capacity with `fs.getCapacity` and
+`fs.getFreeSpace`; no computer or floppy capacity is hardcoded.
+
+### Install ATLAS with Allay
+
+Install Allay once:
+
+```lua
+wget run https://raw.githubusercontent.com/allaycc/allay/main/install.lua
+```
+
+Add this repository as a package source:
+
+```text
+allay source add alfaoz/terrain-surveyor
+```
+
+On the home station computer:
+
+```text
+allay install atlas-station
+atlas-station
+```
+
+On each aircraft computer:
+
+```text
+allay install atlas-navigator
+atlas-navigator
+```
+
+`atlas-station` and `atlas-navigator` both depend on `atlas-core`, which Allay
+installs and updates automatically. The package manifests pin SHA-256 hashes
+for every downloaded Lua file.
+
+## Legacy launcher
+
+[`examples/terrain_map.lua`](examples/terrain_map.lua) launches the ATLAS
+Navigator for compatibility with the earlier terrain-map prototype.
+
+Controls:
+
+- `+` / `-` or mouse wheel: zoom in and out
+- Arrow keys: pan and leave follow mode
+- Space: recenter and resume follow mode
+- `G`: toggle chunk grid
+- `C`: toggle 10-block contour lines
+- `O`: toggle clearance-obstacle stippling
+- `W`: enter an exact waypoint
+- Left-click the map: append a waypoint
+- `N`: advance to the next waypoint
+- `H`: calibrate CC:Sable heading to the current straight-line ground track
+- `R`: rescan the current chunk
+- `Q`: close and return to text mode
+
+The zoom levels range from four blocks per pixel to eight pixels per block.
+Unknown tiles remain dark until the aircraft loads them and the surveyor
+finishes scanning them.
+
+## Build
+
+```sh
+./gradlew clean build
+```
+
+The distributable JAR is written to `build/libs/`.
+
+For a local integration run against the exact target profile:
+
+```sh
+./gradlew runServer \
+  -Plocal_mods_dir="/absolute/path/to/the/profile/mods"
+```
+
+That optional test runtime loads only CC:Tweaked, Create, Sable, and CC Better
+Recipes from the profile.
