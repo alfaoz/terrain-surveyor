@@ -234,6 +234,8 @@ Controls:
 - Arrow keys: pan and leave follow mode
 - Space, Escape, `B`, or the `CTR` button: recenter and resume follow mode
 - `HOME`: return to the network menu without closing the navigator
+- On startup, the navigator automatically reconnects to the remembered station;
+  if it is unavailable, the network menu opens instead
 - `C` on the Home screen: change the vehicle code (`XX-NN`, such as `AC-01`)
 - `G`: toggle chunk grid
 - `C`: toggle 10-block contour lines

@@ -17,7 +17,7 @@ return {
             file = "allay/atlas-station.lua"
         },
         ["atlas-navigator"] = {
-            version = "1.4.1",
+            version = "1.4.2",
             description = "Shared CC:Graphics terrain, POI, and waypoint navigator",
             file = "allay/atlas-navigator.lua"
         }

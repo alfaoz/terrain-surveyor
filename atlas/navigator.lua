@@ -296,6 +296,7 @@ else
 end
 navConfig.writeKey = navConfig.writeKey or ""
 navConfig.lastServer = navConfig.lastServer or ""
+navConfig.lastServerId = tonumber(navConfig.lastServerId)
 navConfig.headingOffset = tonumber(navConfig.headingOffset) or 0
 navConfig.scanBatchChunks = clamp(
     tonumber(navConfig.scanBatchChunks) or DEFAULT_SCAN_BATCH_CHUNKS, 1, 16)
@@ -904,12 +905,37 @@ function fitTerminal(text, width)
     return text:sub(1, math.max(0, width - 1)) .. "~"
 end
 
-function chooseStation(hasWireless)
+function rememberStation(station)
+    navConfig.lastServer = station.name or ""
+    navConfig.lastServerId = station.id
+    atlas.writeTable(NAV_CONFIG_PATH, navConfig)
+    return station.id, station
+end
+
+function chooseStation(hasWireless, autoConnect)
     if not hasWireless then return nil, nil end
     local stations = discoverStations()
     local selected = #stations > 0 and 1 or 0
+    local remembered
     for index, station in ipairs(stations) do
-        if station.name == navConfig.lastServer then selected = index end
+        if navConfig.lastServerId
+            and station.id == navConfig.lastServerId then
+            selected = index
+            remembered = station
+            break
+        end
+    end
+    if not remembered and navConfig.lastServer ~= "" then
+        for index, station in ipairs(stations) do
+            if station.name == navConfig.lastServer then
+                selected = index
+                remembered = station
+                break
+            end
+        end
+    end
+    if autoConnect and remembered then
+        return rememberStation(remembered)
     end
 
     while running do
@@ -973,10 +999,7 @@ function chooseStation(hasWireless)
             elseif event[2] == keys.down then
                 selected = math.min(#stations, selected + 1)
             elseif event[2] == keys.enter and stations[selected] then
-                local station = stations[selected]
-                navConfig.lastServer = station.name or ""
-                atlas.writeTable(NAV_CONFIG_PATH, navConfig)
-                return station.id, station
+                return rememberStation(stations[selected])
             elseif event[2] == keys.escape then
                 return serverId, serverInfo, "cancel"
             end
@@ -1000,10 +1023,7 @@ function chooseStation(hasWireless)
                 end
             elseif y == height - 1 and x >= 2 and x <= 10
                 and stations[selected] then
-                local station = stations[selected]
-                navConfig.lastServer = station.name or ""
-                atlas.writeTable(NAV_CONFIG_PATH, navConfig)
-                return station.id, station
+                return rememberStation(stations[selected])
             elseif y == height - 1 and x >= 14 and x <= 21 then
                 stations = discoverStations()
                 selected = #stations > 0 and 1 or 0
@@ -3417,6 +3437,7 @@ function openHomeMenu()
         else
             linkStatus = "OFFLINE"
             navConfig.lastServer = ""
+            navConfig.lastServerId = nil
         end
         atlas.writeTable(NAV_CONFIG_PATH, navConfig)
     else
@@ -3612,7 +3633,7 @@ function main()
     restoreTextPalette()
     atlas.writeTable(NAV_CONFIG_PATH, navConfig)
     local wireless = atlas.openWirelessRednet()
-    serverId, serverInfo = chooseStation(#wireless > 0)
+    serverId, serverInfo = chooseStation(#wireless > 0, true)
     if not running then return end
     if serverId then
         linkStatus = "ONLINE"
