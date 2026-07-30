@@ -1,5 +1,5 @@
 -- ATLAS Navigator for:
---   Terrain Surveyor 0.2.0
+--   Terrain Surveyor 0.2.1
 --   CC: Tweaked 1.120.0
 --   CC: Graphics 0.2.0
 --
@@ -19,6 +19,7 @@ local RETRY_MS = 1500
 local UNLOADED_RETRY_MS = 250
 local DEFAULT_SCAN_BATCH_CHUNKS = 8
 local DEFAULT_SCAN_BUDGET_MICROS = 4000
+local DEFAULT_SCAN_REQUEST_WINDOW = 32
 local SCAN_PREFETCH_TARGET = 96
 local CACHE_WRITES_PER_TICK = 6
 local NETWORK_TICK_SECONDS = 0.05
@@ -301,7 +302,7 @@ navConfig.lastServer = navConfig.lastServer or ""
 navConfig.lastServerId = tonumber(navConfig.lastServerId)
 navConfig.headingOffset = tonumber(navConfig.headingOffset) or 0
 navConfig.scanBatchChunks = clamp(
-    tonumber(navConfig.scanBatchChunks) or DEFAULT_SCAN_BATCH_CHUNKS, 1, 16)
+    tonumber(navConfig.scanBatchChunks) or DEFAULT_SCAN_BATCH_CHUNKS, 1, 24)
 navConfig.scanBudgetMicros = clamp(
     tonumber(navConfig.scanBudgetMicros) or DEFAULT_SCAN_BUDGET_MICROS,
     500, 8000)
@@ -406,6 +407,9 @@ local scanMetrics = {
     aheadChunks = 0,
     aheadSeconds = 0,
     lastBatchChunks = 0,
+    lastBatchRequests = 0,
+    lastBatchInspected = 0,
+    lastBatchUnloaded = 0,
     lastBatchMicros = 0,
     batchSupported = false
 }
@@ -1588,8 +1592,19 @@ function scanAvailable(infoValue)
         maximum = math.max(maximum, math.min(
             12, tonumber(infoValue.maxBatchChunks) or 16))
     end
+    local maxRequests = tonumber(infoValue.maxBatchRequests)
+        or DEFAULT_SCAN_REQUEST_WINDOW
+    local requestWindow
+    if motion.speed >= 8 then
+        requestWindow = maxRequests
+    elseif motion.speed >= 4 then
+        requestWindow = math.min(64, maxRequests)
+    else
+        requestWindow = math.min(DEFAULT_SCAN_REQUEST_WINDOW, maxRequests)
+    end
+    requestWindow = math.max(maximum, requestWindow)
     local selected, selectedKeys, waitingForSharedMap =
-        chooseScanBatch(infoValue, maximum)
+        chooseScanBatch(infoValue, requestWindow)
     if #selected == 0 then
         scanStatus = waitingForSharedMap
             and "SYNCING SHARED MAP" or "CURRENT"
@@ -1639,14 +1654,24 @@ function scanAvailable(infoValue)
 
     local originChunkX = tonumber(result.chunkX) or infoValue.chunkX
     local originChunkZ = tonumber(result.chunkZ) or infoValue.chunkZ
+    local unloadedCount = type(result.unloaded) == "table"
+        and #result.unloaded or 0
     markBatchOffsetsForRetry(
-        result.unloaded, originChunkX, originChunkZ, UNLOADED_RETRY_MS)
+        result.unloaded,
+        originChunkX,
+        originChunkZ,
+        motion.speed >= 8 and 100 or UNLOADED_RETRY_MS)
     scanMetrics.lastBatchChunks = completed
+    scanMetrics.lastBatchRequests =
+        tonumber(result.requested) or #selected
+    scanMetrics.lastBatchInspected =
+        tonumber(result.inspected) or 0
+    scanMetrics.lastBatchUnloaded = unloadedCount
     scanMetrics.lastBatchMicros = tonumber(result.elapsedMicros) or 0
     recordCompletedScans(completed)
     scanStatus = completed > 0
-        and ("BATCH +%d"):format(completed)
-        or type(result.unloaded) == "table" and #result.unloaded > 0
+        and ("BATCH +%d/%d"):format(completed, #selected)
+        or unloadedCount > 0
             and "WAITING FOR CHUNKS"
         or "BUDGET WAIT"
     updateScanTelemetry(infoValue)

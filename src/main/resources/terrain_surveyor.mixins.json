@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.terrainsurveyor.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "plugin": "dev.terrainsurveyor.mixin.TerrainSurveyorMixinPlugin",
+  "client": [
+    "PocketItemRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

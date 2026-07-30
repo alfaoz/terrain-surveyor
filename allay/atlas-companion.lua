@@ -1,6 +1,6 @@
 return {
     name = "atlas-companion",
-    version = "1.0.1",
+    version = "1.0.2",
     description = "Paired ATLAS pocket moving map and aircraft route controller",
     author = "alfaoz",
 
@@ -16,7 +16,7 @@ return {
     },
 
     hashes = {
-        ["companion.lua"] = "b856d36176768deb038b710a3e3e77264d96e6f0aba298f018a194b62159d7cd",
+        ["companion.lua"] = "5aea2ea1096b3c3974c0d75df4636344c674f21d07f852ff438aafb9fe78d6b6",
         ["startup-companion.lua"] = "74606d147713d54cae396e0cc84ec4b20e8671cd785e27f61fcb63a77b17d2f4"
     },
 

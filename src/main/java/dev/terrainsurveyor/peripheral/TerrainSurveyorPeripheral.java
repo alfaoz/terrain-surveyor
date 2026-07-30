@@ -31,10 +31,10 @@ import net.minecraft.world.phys.Vec3;
 
 public final class TerrainSurveyorPeripheral implements IPeripheral {
     public static final int FORMAT_VERSION = 1;
-    public static final int MAX_CHUNK_RADIUS = 8;
-    public static final int MAX_BATCH_REQUESTS = 96;
+    public static final int MAX_CHUNK_RADIUS = 12;
+    public static final int MAX_BATCH_REQUESTS = 128;
     public static final int DEFAULT_BATCH_CHUNKS = 8;
-    public static final int MAX_BATCH_CHUNKS = 16;
+    public static final int MAX_BATCH_CHUNKS = 24;
     public static final int DEFAULT_SCAN_BUDGET_MICROS = 4_000;
     public static final int MIN_SCAN_BUDGET_MICROS = 500;
     public static final int MAX_SCAN_BUDGET_MICROS = 8_000;

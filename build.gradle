@@ -34,6 +34,13 @@ repositories {
             includeGroup "cc.tweaked"
         }
     }
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+        content {
+            includeGroup "maven.modrinth"
+        }
+    }
 }
 
 base {
@@ -125,6 +132,7 @@ configurations {
 
 dependencies {
     compileOnly "cc.tweaked:cc-tweaked-${minecraft_version}-forge:${cc_tweaked_version}"
+    compileOnly "maven.modrinth:cc-graphics:${cc_graphics_version_id}"
     testImplementation "cc.tweaked:cobalt:0.9.9"
 
     // Opt-in integration-test runtime. Pass
@@ -135,7 +143,8 @@ dependencies {
                 "cc-tweaked-1.21.1-forge-1.120.0.jar",
                 "create-1.21.1-6.0.10.jar",
                 "sable-neoforge-1.21.1-2.0.3.jar",
-                "ccbr-1.2.0-neoforge-1.21.1.jar"
+                "ccbr-1.2.0-neoforge-1.21.1.jar",
+                "ccgraphics-1.21.1-forge-0.2.0.jar"
         ].each { fileName ->
             def modFile = new File(localMods, fileName)
             if (!modFile.isFile()) {
@@ -190,6 +199,7 @@ var generateModMetadata = tasks.register("generateModMetadata", ProcessResources
             mod_license            : mod_license,
             mod_version            : mod_version,
             cc_tweaked_version     : cc_tweaked_version,
+            cc_graphics_version    : cc_graphics_version,
             create_version         : create_version,
             sable_version          : sable_version,
             sable_companion_version: sable_companion_version,

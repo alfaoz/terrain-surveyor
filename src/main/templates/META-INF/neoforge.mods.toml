@@ -33,9 +33,8 @@ A compact, passive CC:Tweaked peripheral which surveys full-resolution terrain
 height data for navigation aboard Sable contraptions.
 '''
 
-# The [[mixins]] block allows you to declare your mixin config to FML so that it gets loaded.
-#[[mixins]]
-#config="${mod_id}.mixins.json"
+[[mixins]]
+config="${mod_id}.mixins.json"
 
 # The [[accessTransformers]] block allows you to declare where your AT file is.
 # If this block is omitted, a fallback attempt will be made to load an AT from META-INF/accesstransformer.cfg
@@ -78,6 +77,14 @@ height data for navigation aboard Sable contraptions.
     versionRange="[${cc_tweaked_version},)"
     ordering="AFTER"
     side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="ccgraphics"
+    type="optional"
+    reason="Adds graphics-mode rendering to the in-hand pocket computer display"
+    versionRange="[${cc_graphics_version},)"
+    ordering="AFTER"
+    side="CLIENT"
 
 [[dependencies.${mod_id}]]
     modId="create"

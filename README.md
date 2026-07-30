@@ -13,6 +13,7 @@ does not emit redstone, and needs no kinetic power.
 - Minecraft 1.21.1
 - NeoForge 21.1.243
 - CC:Tweaked 1.120.0
+- CC: Graphics 0.2.0
 - Create 6.0.10
 - Sable 2.0.3 (including Sable Companion 1.6.0)
 - Create: CC Better Recipes 1.2.0
@@ -57,7 +58,7 @@ radius.
 ### `scanChunk(dx, dz)`
 
 Scans an already-loaded chunk relative to the chunk containing the surveyor.
-Both offsets must be between `-8` and `8`, providing a 17×17-chunk survey
+Both offsets must be between `-12` and `12`, providing a 25×25-chunk survey
 window centered on the aircraft. Calling the method does not generate, load, or
 force-load chunks, so results are still bounded by the server's loaded-chunk
 distance. There is no peripheral cooldown; the calling CraftOS program controls
@@ -67,7 +68,7 @@ the scan rate.
 
 Scans several already-loaded chunks in one server-thread call. `requests` is
 an array of `{ dx, dz }` offsets or `{ chunkX, chunkZ }` absolute chunk
-coordinates. One call accepts up to 96 candidates, completes at most 16
+coordinates. One call accepts up to 128 candidates, completes at most 24
 chunks, and clamps its server-thread budget to 0.5–8 milliseconds. Unloaded
 and budget-deferred requests are returned separately:
 
@@ -76,16 +77,18 @@ local result = surveyor.scanBatch({
   { dx = 0, dz = 0 },
   { dx = 0, dz = -1 },
   { dx = 1, dz = -1 }
-}, 16, 8000)
+}, 24, 8000)
 
 print("scanned", #result.tiles)
 print("not loaded", #result.unloaded)
 print("deferred", #result.deferred)
 ```
 
-ATLAS automatically expands to the full 16-chunk/8 ms batch while the
-aircraft is moving quickly. At lower speeds it uses the configured, gentler
-budget.
+ATLAS automatically expands to the full 24-chunk/8 ms batch while the
+aircraft is moving quickly. It probes up to 128 prioritized candidates per
+pass, allowing the server to skip unloaded chunks and fill the batch from
+terrain which is actually available. At lower speeds it uses a smaller probe
+window and the configured, gentler budget.
 
 The scan runs on the Minecraft server thread and returns:
 
@@ -299,6 +302,15 @@ force scans in unloaded chunks. It does keep every received tile in
 `/atlas/companion-cache`, so previously viewed terrain remains available during
 a brief link loss.
 
+Terrain Surveyor 0.2.1 also supplies the missing CC: Graphics bridge for the
+in-hand Ender Pocket Computer model. When CC: Graphics is installed, the held
+item shows the same graphics framebuffer as its open GUI. This bridge is
+client-only and remains dormant when CC: Graphics is absent.
+
+The companion composes each screen off-screen and publishes one atomic frame.
+Fullscreen or GUI-size changes discard the old layout and trigger a complete
+map rebuild instead of exposing a partially drawn terrain layer.
+
 Companion controls:
 
 - Left-click the map: append a waypoint to the aircraft's route
@@ -326,8 +338,10 @@ open page `4 POIS` to browse the server-owned list. Select a POI and press
 removing it for every aircraft.
 
 The navigator polls position and redraws at the Minecraft tick rate. At speed,
-the native surveyor scans up to 16 station-confirmed missing chunks per poll
+the native surveyor scans up to 24 station-confirmed missing chunks per poll
 inside an 8 ms server-thread budget and prioritizes a narrow forward corridor.
+The high-speed scheduler probes 128 candidates independently of that output
+limit, preventing unloaded edge chunks from starving the loaded scan area.
 Disk writes run in a separate buffered worker. The footer reports measured
 chunks per second, scan backlog, and mapped seconds ahead.
 

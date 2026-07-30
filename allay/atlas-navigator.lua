@@ -1,6 +1,6 @@
 return {
     name = "atlas-navigator",
-    version = "1.5.0",
+    version = "1.5.1",
     description = "Shared ATLAS terrain, companion, POI, cache, and waypoint navigator",
     author = "alfaoz",
 
@@ -19,7 +19,7 @@ return {
     },
 
     hashes = {
-        ["navigator.lua"] = "8bbaf2b54adeb7b758304c41f8023800f3b0ed785adeaccaf1e056e22ba01513",
+        ["navigator.lua"] = "6c9934a5070ca6886f1eb0ff5e5aa6d5d8720befbf4de92c9117b2de38d86c81",
         ["companion-host.lua"] = "3e0aa5dee5c9c98d6bb5c4998768261290a819a024e7149022d58b078c39d9e0",
         ["startup-navigator.lua"] = "0f2e47de97f4a9e2f68cbfc3154249932641adc2630fc0dbbaf98b95c3876295"
     },

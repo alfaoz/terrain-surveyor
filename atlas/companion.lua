@@ -103,6 +103,10 @@ lastStateRequest = 0
 lastHelloRequest = 0
 helloRequestId = nil
 originalPalette = {}
+activeFrame = nil
+displayFailures = 0
+lastGraphicsWidth = nil
+lastGraphicsHeight = nil
 
 function now()
     return atlas.now()
@@ -457,7 +461,7 @@ end
 function connectionButton(
         buttons, x, y, label, action, color, width, height)
     local buttonWidth = math.max(64, #label * 4 + 18)
-    term.drawPixels(x, y, color or COLOR.panelEdge, buttonWidth, 13)
+    fillPixels(x, y, color or COLOR.panelEdge, buttonWidth, 13)
     drawText(x + math.floor((buttonWidth - #label * 4 + 1) / 2),
         y + 4, label, COLOR.text, width, height)
     buttons[#buttons + 1] = {
@@ -503,17 +507,16 @@ function drawConnectionScreen(model)
     local buttons = {}
     local cards = {}
 
-    term.setFrozen(true)
-    term.drawPixels(0, 0, COLOR.background, width, height)
-    term.drawPixels(0, 0, COLOR.panel, width, 20)
-    term.drawPixels(0, 19, COLOR.panelEdge, width, 1)
+    beginFrame(width, height, COLOR.background)
+    fillPixels(0, 0, COLOR.panel, width, 20)
+    fillPixels(0, 19, COLOR.panelEdge, width, 1)
     drawText(10, 5, "ATLAS COMPANION",
         COLOR.text, width, height)
     drawText(width - 106, 5, "SECURE LINK",
         COLOR.textDim, width, height)
 
-    term.drawPixels(left, top, COLOR.panelEdge, panelWidth, panelHeight)
-    term.drawPixels(
+    fillPixels(left, top, COLOR.panelEdge, panelWidth, panelHeight)
+    fillPixels(
         left + 2, top + 2, COLOR.panel,
         panelWidth - 4, panelHeight - 4)
     drawText(left + 14, top + 12,
@@ -544,9 +547,9 @@ function drawConnectionScreen(model)
         local fieldWidth = 176
         local fieldLeft = left + math.floor((panelWidth - fieldWidth) / 2)
         local fieldTop = top + 70
-        term.drawPixels(
+        fillPixels(
             fieldLeft, fieldTop, COLOR.background, fieldWidth, 32)
-        term.drawPixels(
+        fillPixels(
             fieldLeft + 2, fieldTop + 2,
             COLOR.panelEdge, fieldWidth - 4, 28)
         local displayCode = (model.code or "")
@@ -588,11 +591,11 @@ function drawConnectionScreen(model)
                 local cardLeft = left + 12
                 local cardTop = top + 38 + row * 24
                 local selected = index == model.selected
-                term.drawPixels(
+                fillPixels(
                     cardLeft, cardTop,
                     selected and COLOR.route or COLOR.background,
                     panelWidth - 24, 20)
-                term.drawPixels(
+                fillPixels(
                     cardLeft + 2, cardTop + 2,
                     selected and COLOR.panel or COLOR.panelEdge,
                     panelWidth - 28, 16)
@@ -660,7 +663,7 @@ function drawConnectionScreen(model)
         buttons = buttons,
         cards = cards
     }
-    term.setFrozen(false)
+    commitFrame()
 end
 
 function connectionHit(x, y)
@@ -1166,9 +1169,118 @@ function blankRows(width, height)
     return rows
 end
 
+function beginFrame(width, height, color)
+    local row = string.rep(BYTE[color], width)
+    local rows = {}
+    for y = 1, height do rows[y] = row end
+    activeFrame = {
+        width = width,
+        height = height,
+        rows = rows,
+        mutable = {}
+    }
+end
+
+function mutableFrameRow(y)
+    local frame = activeFrame
+    local rowIndex = y + 1
+    local mutable = frame.mutable[rowIndex]
+    if mutable then return mutable end
+    mutable = {}
+    local source = frame.rows[rowIndex]
+    for x = 1, frame.width do
+        mutable[x] = source:sub(x, x)
+    end
+    frame.mutable[rowIndex] = mutable
+    return mutable
+end
+
+function fillPixels(x, y, color, width, height)
+    local frame = activeFrame
+    if not frame then
+        return term.drawPixels(x, y, color, width, height)
+    end
+    local left = math.max(0, math.floor(x))
+    local top = math.max(0, math.floor(y))
+    local right = math.min(
+        frame.width - 1, math.floor(x + width - 1))
+    local bottom = math.min(
+        frame.height - 1, math.floor(y + height - 1))
+    if right < left or bottom < top then return end
+    local pixel = BYTE[color]
+    for pixelY = top, bottom do
+        local row = mutableFrameRow(pixelY)
+        for pixelX = left, right do
+            row[pixelX + 1] = pixel
+        end
+    end
+end
+
+function putFrameRows(x, y, rows, width, height)
+    local frame = activeFrame
+    if not frame then
+        return term.drawPixels(x, y, rows, width, height)
+    end
+    if x == 0 and width == frame.width then
+        for rowIndex = 1, height do
+            local target = y + rowIndex
+            local source = rows[rowIndex]
+            if target >= 1 and target <= frame.height
+                and source and #source == width then
+                frame.rows[target] = source
+                frame.mutable[target] = nil
+            end
+        end
+        return
+    end
+    for sourceY = 0, height - 1 do
+        local source = rows[sourceY + 1]
+        if source then
+            for sourceX = 0, width - 1 do
+                local targetX = x + sourceX
+                local targetY = y + sourceY
+                if targetX >= 0 and targetX < frame.width
+                    and targetY >= 0 and targetY < frame.height then
+                    local row = mutableFrameRow(targetY)
+                    row[targetX + 1] = source:sub(
+                        sourceX + 1, sourceX + 1)
+                end
+            end
+        end
+    end
+end
+
+function abandonFrame()
+    activeFrame = nil
+    pcall(term.setFrozen, false)
+end
+
+function commitFrame()
+    local frame = activeFrame
+    if not frame then return end
+    activeFrame = nil
+    for rowIndex, mutable in pairs(frame.mutable) do
+        frame.rows[rowIndex] = table.concat(mutable)
+    end
+    local frozen = false
+    local ok, failure = xpcall(function()
+        term.setFrozen(true)
+        frozen = true
+        term.drawPixels(
+            0, 0, frame.rows, frame.width, frame.height)
+    end, debug.traceback)
+    if frozen then pcall(term.setFrozen, false) end
+    if not ok then error(failure, 0) end
+end
+
 function drawPixel(x, y, color, width, height)
     if x >= 0 and x < width and y >= 0 and y < height then
-        term.setPixel(x, y, color)
+        if activeFrame then
+            local row = mutableFrameRow(math.floor(y))
+            row[math.floor(x) + 1] = BYTE[color]
+        else
+            term.setPixel(x, y, color)
+        end
     end
 end
 
@@ -1247,7 +1359,7 @@ end
 
 function drawToolbarButton(buttons, x, y, label, action, width, height)
     local buttonWidth = #label * 4 + 7
-    term.drawPixels(x, y, COLOR.panelEdge, buttonWidth, 7)
+    fillPixels(x, y, COLOR.panelEdge, buttonWidth, 7)
     drawText(x + 4, y + 1, label, COLOR.text, width, height)
     buttons[#buttons + 1] = {
         x1 = x, x2 = x + buttonWidth - 1,
@@ -1263,8 +1375,8 @@ function drawRelinkDialog(width, height)
     local dialogHeight = 92
     local left = math.floor((width - dialogWidth) / 2)
     local top = math.floor((height - dialogHeight) / 2)
-    term.drawPixels(left, top, COLOR.panelEdge, dialogWidth, dialogHeight)
-    term.drawPixels(left + 2, top + 2, COLOR.panel,
+    fillPixels(left, top, COLOR.panelEdge, dialogWidth, dialogHeight)
+    fillPixels(left + 2, top + 2, COLOR.panel,
         dialogWidth - 4, dialogHeight - 4)
     drawText(left + 12, top + 11,
         "RE-LINK ATLAS COMPANION?",
@@ -1285,9 +1397,9 @@ function drawRelinkDialog(width, height)
     local buttonTop = top + dialogHeight - 22
     local confirmLeft = left + dialogWidth - confirmWidth - 10
     local cancelLeft = confirmLeft - cancelWidth - 8
-    term.drawPixels(cancelLeft, buttonTop,
+    fillPixels(cancelLeft, buttonTop,
         COLOR.panelEdge, cancelWidth, 13)
-    term.drawPixels(confirmLeft, buttonTop,
+    fillPixels(confirmLeft, buttonTop,
         COLOR.warning, confirmWidth, 13)
     drawText(cancelLeft + 12, buttonTop + 4,
         "CANCEL", COLOR.text, width, height)
@@ -1433,7 +1545,7 @@ function requestMapBuild(request)
     os.queueEvent(MAP_EVENT)
 end
 
-function render()
+function renderFrame()
     local craft = aircraft()
     if not craft then return end
     if follow or not viewX then
@@ -1441,8 +1553,20 @@ function render()
         viewZ = craft.z
     end
     local width, height = term.getSize(2)
+    if width ~= lastGraphicsWidth or height ~= lastGraphicsHeight then
+        lastGraphicsWidth = width
+        lastGraphicsHeight = height
+        mapCache = {}
+        mapBuildRequest = nil
+        blankCache = {}
+        lastDisplay = nil
+        viewportPlan = nil
+    end
     local mapTop = HEADER_HEIGHT
     local mapHeight = height - HEADER_HEIGHT - FOOTER_HEIGHT
+    if mapHeight < 1 then
+        error("Pocket terminal is too short for ATLAS Companion", 0)
+    end
     local pixelsPerBlock = zoom()
     local centerX = (width - 1) / 2
     local centerY = (mapHeight - 1) / 2
@@ -1497,14 +1621,13 @@ function render()
     }
     lastDisplay = display
 
-    term.setFrozen(true)
-    term.drawPixels(0, 0, COLOR.background, width, height)
-    term.drawPixels(0, mapTop, rows, width, mapHeight)
+    beginFrame(width, height, COLOR.background)
+    putFrameRows(0, mapTop, rows, width, mapHeight)
     drawOverlays(display, width, height)
-    term.drawPixels(0, 0, COLOR.panel, width, HEADER_HEIGHT)
-    term.drawPixels(0, HEADER_HEIGHT - 1, COLOR.panelEdge, width, 1)
-    term.drawPixels(0, height - FOOTER_HEIGHT, COLOR.panelEdge, width, 1)
-    term.drawPixels(0, height - FOOTER_HEIGHT + 1,
+    fillPixels(0, 0, COLOR.panel, width, HEADER_HEIGHT)
+    fillPixels(0, HEADER_HEIGHT - 1, COLOR.panelEdge, width, 1)
+    fillPixels(0, height - FOOTER_HEIGHT, COLOR.panelEdge, width, 1)
+    fillPixels(0, height - FOOTER_HEIGHT + 1,
         COLOR.panel, width, FOOTER_HEIGHT - 1)
 
     local link = connected and "ONLINE" or "LOST"
@@ -1567,7 +1690,24 @@ function render()
     drawText(width - 7, mapTop + 3, "N",
         COLOR.text, width, height)
     drawRelinkDialog(width, height)
-    term.setFrozen(false)
+    commitFrame()
+end
+
+function render()
+    local ok, failure = xpcall(renderFrame, debug.traceback)
+    abandonFrame()
+    if ok then
+        displayFailures = 0
+        return
+    end
+    displayFailures = displayFailures + 1
+    mapCache = {}
+    mapBuildRequest = nil
+    lastDisplay = nil
+    statusText = "DISPLAY RECOVERING"
+    if displayFailures >= 3 then
+        error(failure, 0)
+    end
 end
 
 function displayLoop()
@@ -1754,6 +1894,16 @@ function inputLoop()
         if event[1] == "terminate" then
             quitAll = true
             running = false
+        elseif event[1] == "term_resize" then
+            abandonFrame()
+            mapCache = {}
+            mapBuildRequest = nil
+            blankCache = {}
+            lastDisplay = nil
+            lastGraphicsWidth = nil
+            lastGraphicsHeight = nil
+            viewportPlan = nil
+            statusText = "DISPLAY RESIZED"
         elseif linkDialog then
             handleRelinkEvent(event)
         elseif event[1] == "char" then
@@ -1861,6 +2011,9 @@ function runGraphics()
     viewportPlan = nil
     mapCache = {}
     mapBuildRequest = nil
+    lastGraphicsWidth = nil
+    lastGraphicsHeight = nil
+    displayFailures = 0
     parallel.waitForAny(
         inputLoop,
         displayLoop,
