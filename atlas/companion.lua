@@ -85,6 +85,8 @@ running = false
 quitAll = false
 switchRequested = false
 modal = false
+linkDialog = nil
+connectionUi = nil
 statusText = "STARTING"
 viewX = nil
 viewZ = nil
@@ -231,7 +233,7 @@ function renderTilePixels(tile)
             local color = COLOR.unknown
             if surface then
                 local fluidKind = flags % 4
-                if fluid and fluid >= surface then
+                if fluid and fluid >= surface and fluidKind ~= 0 then
                     color = fluidKind == 1 and COLOR.water
                         or fluidKind == 2 and COLOR.lava
                         or COLOR.fluid
@@ -389,33 +391,7 @@ function acceptConnection(identifier, message)
     return true
 end
 
-function connectSaved()
-    if type(config.navigatorId) ~= "number"
-        or type(config.pairId) ~= "string"
-        or type(config.secret) ~= "string" then return false end
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("ATLAS COMPANION")
-    print()
-    print("Reconnecting to " .. tostring(config.callsign or "aircraft") .. "...")
-    local response = exchange(config.navigatorId, "hello", {
-        pairId = config.pairId,
-        secret = config.secret,
-        name = os.getComputerLabel()
-            or ("ATLAS POCKET " .. os.getComputerID())
-    }, 1.5)
-    if response and response.op == "hello_accepted" then
-        return acceptConnection(config.navigatorId, response)
-    end
-    return false
-end
-
 function discoverAircraft()
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("ATLAS COMPANION")
-    print()
-    print("Searching for aircraft...")
     local identifiers = {
         rednet.lookup(atlas.PROTOCOL_COMPANION_DISCOVERY)
     }
@@ -449,96 +425,261 @@ function discoverAircraft()
     return found
 end
 
-function waitMenuKey()
-    while true do
-        local event, value = os.pullEventRaw()
-        if event == "terminate" then
-            quitAll = true
-            return "quit"
-        elseif event == "char" then
-            value = value:lower()
-            if value == "r" then return "retry" end
-            if value == "q" then return "quit" end
-        end
-    end
+function isSavedAircraft(candidate)
+    return candidate
+        and candidate.id == config.navigatorId
+        and type(config.pairId) == "string"
+        and type(config.secret) == "string"
 end
 
-function selectAircraft(found)
-    if #found == 0 then
-        term.clear()
-        term.setCursorPos(1, 1)
-        print("ATLAS COMPANION")
-        print()
-        print("No aircraft navigators answered.")
-        print("Open PAIR on the aircraft and check both Ender Modems.")
-        print()
-        print("[R] Retry    [Q] Quit")
-        return nil, waitMenuKey()
+function beginConnectionGraphics()
+    if not term.setGraphicsMode or not term.drawPixels
+        or not term.setFrozen then
+        error("CC: Graphics is required by ATLAS Companion", 0)
     end
-
-    local selected = 1
-    while true do
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.setTextColor(colors.orange)
-        print("ATLAS COMPANION - SELECT AIRCRAFT")
-        term.setTextColor(colors.white)
-        print()
-        for index, candidate in ipairs(found) do
-            local prefix = index == selected and "> " or "  "
-            local pairing = candidate.pairingOpen and "PAIRING" or "LOCKED"
-            print(("%s%-8s ID:%d  %s"):format(
-                prefix,
-                tostring(candidate.callsign or "AIRCRAFT"),
-                candidate.id,
-                pairing))
-        end
-        print()
-        print("Arrows + Enter select   R refresh   Q quit")
-        local event, value = os.pullEventRaw()
-        if event == "terminate" then
-            quitAll = true
-            return nil, "quit"
-        elseif event == "key" then
-            if value == keys.up then
-                selected = selected == 1 and #found or selected - 1
-            elseif value == keys.down then
-                selected = selected == #found and 1 or selected + 1
-            elseif value == keys.enter then
-                return found[selected], "select"
-            end
-        elseif event == "char" then
-            value = value:lower()
-            if value == "r" then return nil, "retry" end
-            if value == "q" then return nil, "quit" end
-        end
+    local ok, failure = pcall(term.setGraphicsMode, 2)
+    if not ok then
+        error("Cannot enter graphics mode: " .. tostring(failure), 0)
     end
+    configurePalette()
 end
 
-function pairAircraft(candidate)
+function endConnectionGraphics()
+    pcall(term.setFrozen, false)
+    pcall(term.setGraphicsMode, false)
+    restorePalette()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    term.setTextColor(colors.orange)
-    print("PAIR " .. tostring(candidate.callsign or "AIRCRAFT"))
-    term.setTextColor(colors.white)
-    print()
-    if not candidate.pairingOpen then
-        print("Pairing is not open on that navigator.")
-        print("Press PAIR on its map, then retry.")
-        print()
-        print("Press any key.")
-        os.pullEvent("key")
-        return false
+end
+
+function connectionButton(
+        buttons, x, y, label, action, color, width, height)
+    local buttonWidth = math.max(64, #label * 4 + 18)
+    term.drawPixels(x, y, color or COLOR.panelEdge, buttonWidth, 13)
+    drawText(x + math.floor((buttonWidth - #label * 4 + 1) / 2),
+        y + 4, label, COLOR.text, width, height)
+    buttons[#buttons + 1] = {
+        x1 = x,
+        x2 = x + buttonWidth - 1,
+        y1 = y,
+        y2 = y + 12,
+        action = action
+    }
+    return x + buttonWidth + 8
+end
+
+function connectionRadar(centerX, centerY, width, height)
+    for radius = 10, 34, 8 do
+        for degrees = 0, 345, 15 do
+            local radians = math.rad(degrees)
+            drawPixel(
+                math.floor(centerX + math.cos(radians) * radius + 0.5),
+                math.floor(centerY + math.sin(radians) * radius + 0.5),
+                COLOR.panelEdge, width, height)
+        end
     end
-    write("Pair code: ")
-    local code = read():gsub("%s+", "")
-    if code == "" then return false end
-    local digits = code:gsub("%D", "")
-    if #digits == 6 then
-        code = digits:sub(1, 3) .. "-" .. digits:sub(4, 6)
+    drawLine(centerX - 38, centerY, centerX + 38, centerY,
+        COLOR.panelEdge, width, height)
+    drawLine(centerX, centerY - 38, centerX, centerY + 38,
+        COLOR.panelEdge, width, height)
+    drawLine(centerX, centerY, centerX + 27, centerY - 27,
+        COLOR.route, width, height)
+    for offset = -2, 2 do
+        drawPixel(centerX + offset, centerY,
+            COLOR.aircraft, width, height)
+        drawPixel(centerX, centerY + offset,
+            COLOR.aircraft, width, height)
     end
-    print()
-    print("Pairing...")
+end
+
+function drawConnectionScreen(model)
+    local width, height = term.getSize(2)
+    local panelWidth = math.min(560, width - 32)
+    local panelHeight = math.min(height - 42, 224)
+    local left = math.floor((width - panelWidth) / 2)
+    local top = math.floor((height - panelHeight) / 2) + 8
+    local buttons = {}
+    local cards = {}
+
+    term.setFrozen(true)
+    term.drawPixels(0, 0, COLOR.background, width, height)
+    term.drawPixels(0, 0, COLOR.panel, width, 20)
+    term.drawPixels(0, 19, COLOR.panelEdge, width, 1)
+    drawText(10, 5, "ATLAS COMPANION",
+        COLOR.text, width, height)
+    drawText(width - 106, 5, "SECURE LINK",
+        COLOR.textDim, width, height)
+
+    term.drawPixels(left, top, COLOR.panelEdge, panelWidth, panelHeight)
+    term.drawPixels(
+        left + 2, top + 2, COLOR.panel,
+        panelWidth - 4, panelHeight - 4)
+    drawText(left + 14, top + 12,
+        model.mode == "code"
+            and ("PAIR " .. tostring(model.candidate.callsign))
+            or model.mode == "reconnecting"
+                and "RESTORING AIRCRAFT LINK"
+                or "SELECT AIRCRAFT",
+        COLOR.text, width, height)
+    drawText(left + 14, top + 21,
+        model.mode == "code"
+            and "ENTER THE CODE SHOWN IN THE COCKPIT"
+            or model.mode == "reconnecting"
+                and ("LAST LINK "
+                    .. tostring(model.callsign or "AIRCRAFT"))
+                or "ENDER MODEM DISCOVERY",
+        COLOR.textDim, width, height)
+
+    if model.mode == "scanning" or model.mode == "reconnecting" then
+        local centerX = left + math.floor(panelWidth / 2)
+        local centerY = top + math.floor(panelHeight / 2) + 3
+        connectionRadar(centerX, centerY, width, height)
+        drawText(centerX - 38, centerY + 49,
+            model.mode == "scanning"
+                and "SCANNING" or "AUTHENTICATING",
+            COLOR.route, width, height)
+    elseif model.mode == "code" then
+        local fieldWidth = 176
+        local fieldLeft = left + math.floor((panelWidth - fieldWidth) / 2)
+        local fieldTop = top + 70
+        term.drawPixels(
+            fieldLeft, fieldTop, COLOR.background, fieldWidth, 32)
+        term.drawPixels(
+            fieldLeft + 2, fieldTop + 2,
+            COLOR.panelEdge, fieldWidth - 4, 28)
+        local displayCode = (model.code or "")
+            .. string.rep("_", 6 - #(model.code or ""))
+        displayCode = displayCode:sub(1, 3)
+            .. "-" .. displayCode:sub(4, 6)
+        drawText(fieldLeft + 55, fieldTop + 13,
+            displayCode, COLOR.route, width, height)
+        drawText(fieldLeft + 2, fieldTop + 43,
+            "SIX DIGITS  PAIRING EXPIRES IN TWO MINUTES",
+            COLOR.textDim, width, height)
+        local buttonX = left + math.floor((panelWidth - 152) / 2)
+        buttonX = connectionButton(
+            buttons, buttonX, top + panelHeight - 31,
+            "PAIR", "pair", COLOR.route, width, height)
+        connectionButton(
+            buttons, buttonX, top + panelHeight - 31,
+            "BACK", "back", COLOR.panelEdge, width, height)
+    else
+        local found = model.found or {}
+        if #found == 0 then
+            local centerX = left + math.floor(panelWidth / 2)
+            connectionRadar(centerX, top + 86, width, height)
+            drawText(centerX - 68, top + 134,
+                "NO AIRCRAFT FOUND", COLOR.warning, width, height)
+            drawText(centerX - 136, top + 146,
+                "PRESS PAIR IN THE COCKPIT AND REFRESH",
+                COLOR.textDim, width, height)
+        else
+            local maximumRows = math.max(
+                1, math.floor((panelHeight - 100) / 24))
+            local first = math.max(1,
+                math.min(model.selected - maximumRows + 1,
+                    math.max(1, #found - maximumRows + 1)))
+            for row = 0, maximumRows - 1 do
+                local index = first + row
+                local candidate = found[index]
+                if not candidate then break end
+                local cardLeft = left + 12
+                local cardTop = top + 38 + row * 24
+                local selected = index == model.selected
+                term.drawPixels(
+                    cardLeft, cardTop,
+                    selected and COLOR.route or COLOR.background,
+                    panelWidth - 24, 20)
+                term.drawPixels(
+                    cardLeft + 2, cardTop + 2,
+                    selected and COLOR.panel or COLOR.panelEdge,
+                    panelWidth - 28, 16)
+                drawText(cardLeft + 10, cardTop + 6,
+                    tostring(candidate.callsign or "AIRCRAFT"),
+                    COLOR.text, width, height)
+                drawText(cardLeft + 90, cardTop + 6,
+                    ("ID:%d"):format(candidate.id),
+                    COLOR.textDim, width, height)
+                local stateLabel = isSavedAircraft(candidate)
+                    and "PAIRED"
+                    or candidate.pairingOpen
+                        and "PAIRING OPEN" or "LOCKED"
+                local labelX = cardLeft + panelWidth
+                    - 38 - #stateLabel * 4
+                drawText(labelX, cardTop + 6, stateLabel,
+                    isSavedAircraft(candidate)
+                        and COLOR.traffic
+                        or candidate.pairingOpen
+                            and COLOR.route or COLOR.warning,
+                    width, height)
+                cards[#cards + 1] = {
+                    x1 = cardLeft,
+                    x2 = cardLeft + panelWidth - 25,
+                    y1 = cardTop,
+                    y2 = cardTop + 19,
+                    index = index
+                }
+            end
+        end
+        if #found > 0 then
+            local buttonX = left + math.floor((panelWidth - 244) / 2)
+            buttonX = connectionButton(
+                buttons, buttonX, top + panelHeight - 31,
+                "SELECT", "select", COLOR.route, width, height)
+            buttonX = connectionButton(
+                buttons, buttonX, top + panelHeight - 31,
+                "REFRESH", "refresh", COLOR.panelEdge, width, height)
+            connectionButton(
+                buttons, buttonX, top + panelHeight - 31,
+                "QUIT", "quit", COLOR.warning, width, height)
+        else
+            local buttonX = left + math.floor((panelWidth - 136) / 2)
+            buttonX = connectionButton(
+                buttons, buttonX, top + panelHeight - 31,
+                "RETRY", "refresh", COLOR.route, width, height)
+            connectionButton(
+                buttons, buttonX, top + panelHeight - 31,
+                "QUIT", "quit", COLOR.warning, width, height)
+        end
+    end
+
+    if model.message and model.message ~= "" then
+        drawText(left + 14, top + panelHeight - 48,
+            fitText(model.message, panelWidth - 28),
+            COLOR.warning, width, height)
+    end
+
+    drawText(8, height - 9,
+        model.mode == "code"
+            and "TYPE CODE  ENTER PAIR  ESC BACK"
+            or "ARROWS SELECT  ENTER OPEN  R REFRESH  Q QUIT",
+        COLOR.textDim, width, height)
+    connectionUi = {
+        buttons = buttons,
+        cards = cards
+    }
+    term.setFrozen(false)
+end
+
+function connectionHit(x, y)
+    for _, card in ipairs(connectionUi and connectionUi.cards or {}) do
+        if x >= card.x1 and x <= card.x2
+            and y >= card.y1 and y <= card.y2 then
+            return "card", card.index
+        end
+    end
+    for _, button in ipairs(connectionUi and connectionUi.buttons or {}) do
+        if x >= button.x1 and x <= button.x2
+            and y >= button.y1 and y <= button.y2 then
+            return button.action
+        end
+    end
+end
+
+function attemptPair(candidate, digits)
+    local code = digits:sub(1, 3) .. "-" .. digits:sub(4, 6)
     local response = exchange(candidate.id, "pair_request", {
         code = code,
         name = os.getComputerLabel()
@@ -554,26 +695,160 @@ function pairAircraft(candidate)
         saveConfig()
         return acceptConnection(candidate.id, response)
     end
-    term.setTextColor(colors.red)
-    print("Pairing failed: " .. tostring(
-        response and response.reason or "no reply"))
-    term.setTextColor(colors.white)
-    print("Press any key.")
-    os.pullEvent("key")
-    return false
+    return false, tostring(response and response.reason or "NO REPLY")
+end
+
+function reconnectSavedAircraft(candidate)
+    local response = exchange(candidate.id, "hello", {
+        pairId = config.pairId,
+        secret = config.secret,
+        name = os.getComputerLabel()
+            or ("ATLAS POCKET " .. os.getComputerID())
+    }, 1.5)
+    if response and response.op == "hello_accepted" then
+        return acceptConnection(candidate.id, response)
+    end
+    return false, tostring(response and response.reason or "NO REPLY")
+end
+
+function connectSaved()
+    if type(config.navigatorId) ~= "number"
+        or type(config.pairId) ~= "string"
+        or type(config.secret) ~= "string" then return false end
+    beginConnectionGraphics()
+    drawConnectionScreen({
+        mode = "reconnecting",
+        callsign = config.callsign
+    })
+    local connectedToSaved = reconnectSavedAircraft({
+        id = config.navigatorId
+    })
+    endConnectionGraphics()
+    return connectedToSaved == true
 end
 
 function connectionMenu()
+    beginConnectionGraphics()
+    local found = {}
+    local selected = 1
+    local mode = "list"
+    local candidate
+    local digits = ""
+    local message
+    local rescan = true
     while not quitAll do
-        local found = discoverAircraft()
-        local candidate, action = selectAircraft(found)
+        if rescan then
+            drawConnectionScreen({ mode = "scanning" })
+            found = discoverAircraft()
+            selected = clamp(selected, 1, math.max(1, #found))
+            mode = "list"
+            message = #found == 0
+                and "CHECK BOTH ENDER MODEMS" or nil
+            rescan = false
+        end
+        drawConnectionScreen({
+            mode = mode,
+            found = found,
+            selected = selected,
+            candidate = candidate,
+            code = digits,
+            message = message
+        })
+        local event = table.pack(os.pullEventRaw())
+        if event[1] == "terminate" then
+            quitAll = true
+            break
+        end
+
+        local action
+        local cardIndex
+        if event[1] == "mouse_click" then
+            action, cardIndex = connectionHit(event[3], event[4])
+            if action == "card" then
+                selected = cardIndex
+                action = "select"
+            end
+        elseif event[1] == "key" then
+            if mode == "code" then
+                if event[2] == keys.backspace then
+                    digits = digits:sub(1, -2)
+                elseif event[2] == keys.enter then
+                    action = "pair"
+                elseif event[2] == keys.escape then
+                    action = "back"
+                end
+            else
+                if event[2] == keys.up and #found > 0 then
+                    selected = selected == 1 and #found or selected - 1
+                elseif event[2] == keys.down and #found > 0 then
+                    selected = selected == #found and 1 or selected + 1
+                elseif event[2] == keys.enter then
+                    action = "select"
+                end
+            end
+        elseif event[1] == "char" then
+            local character = event[2]:lower()
+            if mode == "code" and character:match("%d")
+                and #digits < 6 then
+                digits = digits .. character
+            elseif mode ~= "code" and character == "r" then
+                action = "refresh"
+            elseif mode ~= "code" and character == "q" then
+                action = "quit"
+            end
+        end
+
         if action == "quit" then
             quitAll = true
-            return false
-        elseif action == "select" and pairAircraft(candidate) then
-            return true
+            break
+        elseif action == "refresh" then
+            rescan = true
+        elseif action == "back" then
+            mode = "list"
+            digits = ""
+            message = nil
+        elseif action == "select" and found[selected] then
+            candidate = found[selected]
+            if isSavedAircraft(candidate) then
+                drawConnectionScreen({
+                    mode = "reconnecting",
+                    callsign = candidate.callsign
+                })
+                local restored, reason =
+                    reconnectSavedAircraft(candidate)
+                if restored then
+                    endConnectionGraphics()
+                    return true
+                end
+                mode = "list"
+                message = "LINK FAILED: " .. tostring(reason)
+            elseif candidate.pairingOpen then
+                mode = "code"
+                digits = ""
+                message = nil
+            else
+                message = "OPEN PAIR ON THAT AIRCRAFT THEN REFRESH"
+            end
+        elseif action == "pair" then
+            if #digits ~= 6 then
+                message = "ENTER ALL SIX DIGITS"
+            else
+                drawConnectionScreen({
+                    mode = "reconnecting",
+                    callsign = candidate.callsign
+                })
+                local paired, reason = attemptPair(candidate, digits)
+                if paired then
+                    endConnectionGraphics()
+                    return true
+                end
+                mode = "code"
+                digits = ""
+                message = "PAIRING FAILED: " .. tostring(reason)
+            end
         end
     end
+    endConnectionGraphics()
     return false
 end
 
@@ -982,6 +1257,92 @@ function drawToolbarButton(buttons, x, y, label, action, width, height)
     return x + buttonWidth + 2
 end
 
+function drawRelinkDialog(width, height)
+    if not linkDialog then return end
+    local dialogWidth = math.min(292, width - 24)
+    local dialogHeight = 92
+    local left = math.floor((width - dialogWidth) / 2)
+    local top = math.floor((height - dialogHeight) / 2)
+    term.drawPixels(left, top, COLOR.panelEdge, dialogWidth, dialogHeight)
+    term.drawPixels(left + 2, top + 2, COLOR.panel,
+        dialogWidth - 4, dialogHeight - 4)
+    drawText(left + 12, top + 11,
+        "RE-LINK ATLAS COMPANION?",
+        COLOR.text, width, height)
+    drawText(left + 12, top + 27,
+        "THIS WILL DISCONNECT FROM",
+        COLOR.textDim, width, height)
+    drawText(left + 12, top + 38,
+        tostring(state and state.callsign
+            or config.callsign or "CURRENT AIRCRAFT"),
+        COLOR.route, width, height)
+    drawText(left + 12, top + 50,
+        "THE SAVED PAIRING WILL NOT BE DELETED",
+        COLOR.textDim, width, height)
+
+    local cancelWidth = 72
+    local confirmWidth = 88
+    local buttonTop = top + dialogHeight - 22
+    local confirmLeft = left + dialogWidth - confirmWidth - 10
+    local cancelLeft = confirmLeft - cancelWidth - 8
+    term.drawPixels(cancelLeft, buttonTop,
+        COLOR.panelEdge, cancelWidth, 13)
+    term.drawPixels(confirmLeft, buttonTop,
+        COLOR.warning, confirmWidth, 13)
+    drawText(cancelLeft + 12, buttonTop + 4,
+        "CANCEL", COLOR.text, width, height)
+    drawText(confirmLeft + 12, buttonTop + 4,
+        "RE-LINK", COLOR.text, width, height)
+    linkDialog.cancel = {
+        x1 = cancelLeft, x2 = cancelLeft + cancelWidth - 1,
+        y1 = buttonTop, y2 = buttonTop + 12
+    }
+    linkDialog.confirm = {
+        x1 = confirmLeft, x2 = confirmLeft + confirmWidth - 1,
+        y1 = buttonTop, y2 = buttonTop + 12
+    }
+end
+
+function confirmRelink()
+    linkDialog = nil
+    switchRequested = true
+    running = false
+end
+
+function cancelRelink()
+    linkDialog = nil
+    statusText = "RE-LINK CANCELLED"
+end
+
+function handleRelinkEvent(event)
+    if event[1] == "key" then
+        if event[2] == keys.enter then
+            confirmRelink()
+        elseif event[2] == keys.escape then
+            cancelRelink()
+        end
+    elseif event[1] == "char" then
+        local character = event[2]:lower()
+        if character == "y" then
+            confirmRelink()
+        elseif character == "n" then
+            cancelRelink()
+        end
+    elseif event[1] == "mouse_click" then
+        local x = event[3]
+        local y = event[4]
+        local cancel = linkDialog.cancel
+        local confirm = linkDialog.confirm
+        if confirm and x >= confirm.x1 and x <= confirm.x2
+            and y >= confirm.y1 and y <= confirm.y2 then
+            confirmRelink()
+        elseif cancel and x >= cancel.x1 and x <= cancel.x2
+            and y >= cancel.y1 and y <= cancel.y2 then
+            cancelRelink()
+        end
+    end
+end
+
 function bearing(x1, z1, x2, z2)
     local radians
     if math.atan2 then
@@ -1205,6 +1566,7 @@ function render()
     display.buttons = buttons
     drawText(width - 7, mapTop + 3, "N",
         COLOR.text, width, height)
+    drawRelinkDialog(width, height)
     term.setFrozen(false)
 end
 
@@ -1358,8 +1720,8 @@ function performAction(action)
         if craft then viewX = craft.x; viewZ = craft.z end
         viewportPlan = nil
     elseif action == "link" then
-        switchRequested = true
-        running = false
+        linkDialog = {}
+        statusText = "CONFIRM RE-LINK"
     end
 end
 
@@ -1392,6 +1754,8 @@ function inputLoop()
         if event[1] == "terminate" then
             quitAll = true
             running = false
+        elseif linkDialog then
+            handleRelinkEvent(event)
         elseif event[1] == "char" then
             local character = event[2]:lower()
             if character == "q" then
@@ -1493,6 +1857,7 @@ function runGraphics()
     configurePalette()
     running = true
     switchRequested = false
+    linkDialog = nil
     viewportPlan = nil
     mapCache = {}
     mapBuildRequest = nil

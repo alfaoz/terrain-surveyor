@@ -309,7 +309,8 @@ Companion controls:
 - `DEL`: remove the active waypoint
 - Arrow keys: pan; Space, Escape, or `CTR`: follow the aircraft again
 - Mouse wheel or `+` / `-`: zoom
-- `LINK` or `L`: return to aircraft selection without restarting
+- `LINK` or `L`: open an in-map confirmation, then return to the graphical
+  aircraft discovery screen without restarting
 - `Q`: close safely and restore text mode
 
 Route changes use a revision number. If the cockpit and pocket edit at the
