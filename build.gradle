@@ -125,6 +125,7 @@ configurations {
 
 dependencies {
     compileOnly "cc.tweaked:cc-tweaked-${minecraft_version}-forge:${cc_tweaked_version}"
+    testImplementation "cc.tweaked:cobalt:0.9.9"
 
     // Opt-in integration-test runtime. Pass
     // -Plocal_mods_dir=/path/to/the/profile/mods when launching a Gradle run.
@@ -143,6 +144,32 @@ dependencies {
             localRuntime files(modFile)
         }
     }
+}
+
+tasks.register('verifyCraftOsLua', JavaExec) {
+    group = 'verification'
+    description = 'Compiles shipped Lua programs with CC:Tweaked Cobalt.'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.terrainsurveyor.CraftOsLuaCompilerCheck'
+    args(
+            file('atlas/lib.lua'),
+            file('atlas/station.lua'),
+            file('atlas/navigator.lua'),
+            file('examples/surveyor_test.lua'),
+            file('examples/terrain_map.lua'),
+            file('examples/atlas_bandwidth_test.lua')
+    )
+}
+
+tasks.named('check').configure {
+    dependsOn tasks.named('verifyCraftOsLua')
+}
+
+tasks.named('test', Test).configure {
+    // The test source set contains the standalone Cobalt verification runner,
+    // not a JUnit/TestNG suite.
+    failOnNoDiscoveredTests = false
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.

@@ -7,6 +7,9 @@
 
 local LIBRARY = fs.exists("/atlas/lib.lua") and "/atlas/lib.lua" or "atlas/lib.lua"
 local atlas = dofile(LIBRARY)
+-- Keep helpers in a private program environment instead of consuming one
+-- Cobalt local slot each. CraftOS permits at most 200 active locals.
+local _ENV = setmetatable({}, { __index = _ENV })
 
 -- One Minecraft tick: 20 visual/position updates per second.
 local UPDATE_SECONDS = 0.05
@@ -111,21 +114,21 @@ local FONT = {
 local BYTE = {}
 for index = 0, 255 do BYTE[index] = string.char(index) end
 
-local function clamp(value, minimum, maximum)
+function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, value))
 end
 
-local function tableCount(value)
+function tableCount(value)
     local count = 0
     for _ in pairs(value) do count = count + 1 end
     return count
 end
 
-local function lerp(a, b, amount)
+function lerp(a, b, amount)
     return a + (b - a) * amount
 end
 
-local function mixColor(a, b, amount)
+function mixColor(a, b, amount)
     return {
         lerp(a[1], b[1], amount),
         lerp(a[2], b[2], amount),
@@ -133,7 +136,7 @@ local function mixColor(a, b, amount)
     }
 end
 
-local function setPalette(index, rgb)
+function setPalette(index, rgb)
     term.setPaletteColor(index, rgb[1] / 255, rgb[2] / 255, rgb[3] / 255)
 end
 
@@ -144,7 +147,7 @@ for exponent = 0, 15 do
     if ok then originalTextPalette[color] = { red, green, blue } end
 end
 
-local function restoreTextPalette()
+function restoreTextPalette()
     for exponent = 0, 15 do
         local color = 2 ^ exponent
         local red
@@ -165,7 +168,7 @@ local function restoreTextPalette()
     end
 end
 
-local function configurePalette()
+function configurePalette()
     setPalette(COLOR.background, { 14, 18, 20 })
     setPalette(COLOR.unknown, { 25, 31, 33 })
     setPalette(COLOR.water, { 78, 126, 145 })
@@ -210,12 +213,12 @@ local function configurePalette()
     end
 end
 
-local function nowMs()
+function nowMs()
     if os.epoch then return os.epoch("utc") end
     return math.floor(os.clock() * 1000)
 end
 
-local function waitForRawEvent(name, identifier)
+function waitForRawEvent(name, identifier)
     while running do
         local event, value = os.pullEventRaw()
         if event == "terminate" then
@@ -229,15 +232,15 @@ local function waitForRawEvent(name, identifier)
     return false
 end
 
-local function waitSeconds(seconds)
+function waitSeconds(seconds)
     return waitForRawEvent("timer", os.startTimer(seconds))
 end
 
-local function tileKey(dimension, chunkX, chunkZ)
+function tileKey(dimension, chunkX, chunkZ)
     return atlas.tileKey(dimension, chunkX, chunkZ)
 end
 
-local function decodeHeights(data, minY)
+function decodeHeights(data, minY)
     local decoded = {}
     for sample = 0, 255 do
         local byteIndex = sample * 2 + 1
@@ -248,7 +251,7 @@ local function decodeHeights(data, minY)
     return decoded
 end
 
-local function decodeTile(raw)
+function decodeTile(raw)
     local valid, reason = atlas.validateTile(raw)
     if not valid then error("Invalid ATLAS terrain tile: " .. reason, 0) end
 
@@ -271,14 +274,14 @@ local function decodeTile(raw)
     }
 end
 
-local function findSurveyor()
+function findSurveyor()
     local surveyor = peripheral.find("terrain_surveyor")
     if not surveyor then error("No Terrain Surveyor is attached", 0) end
     return surveyor
 end
 
 local navConfig = atlas.readTable(NAV_CONFIG_PATH) or {}
-local function validCallsign(value)
+function validCallsign(value)
     return type(value) == "string"
         and value:upper():match("^[A-Z][A-Z]%-%d%d$") ~= nil
 end
@@ -384,7 +387,7 @@ local scanMetrics = {
     batchSupported = false
 }
 
-local function saveRoute()
+function saveRoute()
     activeWaypoint = math.max(1, math.min(
         activeWaypoint, math.max(1, #waypoints)))
     atlas.writeTable(ROUTE_PATH, {
@@ -393,11 +396,11 @@ local function saveRoute()
     })
 end
 
-local function nextWaypoint()
+function nextWaypoint()
     return waypoints[activeWaypoint]
 end
 
-local function bearingBetween(x1, z1, x2, z2)
+function bearingBetween(x1, z1, x2, z2)
     local radians
     if math.atan2 then
         radians = math.atan2(x2 - x1, -(z2 - z1))
@@ -407,13 +410,13 @@ local function bearingBetween(x1, z1, x2, z2)
     return (math.deg(radians) + 360) % 360
 end
 
-local function distanceBetween(x1, z1, x2, z2)
+function distanceBetween(x1, z1, x2, z2)
     local dx = x2 - x1
     local dz = z2 - z1
     return math.sqrt(dx * dx + dz * dz)
 end
 
-local function quaternionHeading(orientation)
+function quaternionHeading(orientation)
     if type(orientation) ~= "table" then return nil end
 
     -- CC:Sable normally returns an Advanced Math quaternion ({ v, a }).
@@ -443,7 +446,7 @@ local function quaternionHeading(orientation)
     return bearingBetween(0, 0, forwardX, forwardZ)
 end
 
-local function refreshSableMotion()
+function refreshSableMotion()
     if type(sublevel) ~= "table" then return false end
 
     local velocityOk, velocity = pcall(sublevel.getVelocity)
@@ -471,7 +474,7 @@ local function refreshSableMotion()
     return true
 end
 
-local function calibrateHeading()
+function calibrateHeading()
     if not motion.rawHeading then
         scanStatus = "NO SABLE HEADING"
         return
@@ -488,7 +491,7 @@ local function calibrateHeading()
     scanStatus = ("HEADING CAL %+.1f"):format(navConfig.headingOffset)
 end
 
-local function cacheRelativePath(dimension, chunkX, chunkZ)
+function cacheRelativePath(dimension, chunkX, chunkZ)
     local regionX = math.floor(chunkX / 32)
     local regionZ = math.floor(chunkZ / 32)
     return fs.combine(
@@ -498,17 +501,17 @@ local function cacheRelativePath(dimension, chunkX, chunkZ)
         chunkX .. "_" .. chunkZ .. ".tile")
 end
 
-local function localCachePath(dimension, chunkX, chunkZ)
+function localCachePath(dimension, chunkX, chunkZ)
     return "/" .. cacheRelativePath(dimension, chunkX, chunkZ)
 end
 
-local function cacheVolumeById(identifier)
+function cacheVolumeById(identifier)
     for _, volume in ipairs(cacheVolumes) do
         if volume.id == identifier then return volume end
     end
 end
 
-local function cacheEntryPath(entry)
+function cacheEntryPath(entry)
     if not entry then return nil end
     if entry.volumeId and entry.relativePath then
         local volume = cacheVolumeById(entry.volumeId)
@@ -518,7 +521,7 @@ local function cacheEntryPath(entry)
     return entry.path
 end
 
-local function refreshCacheVolumes(force)
+function refreshCacheVolumes(force)
     local currentTime = nowMs()
     if not force
         and currentTime - lastCacheVolumeScan
@@ -587,7 +590,7 @@ local function refreshCacheVolumes(force)
     cacheStorage.free = free
 end
 
-local function chooseCacheVolume(requiredBytes, previous)
+function chooseCacheVolume(requiredBytes, previous)
     refreshCacheVolumes(false)
     local preferred = previous and cacheVolumeById(previous.volumeId)
     if preferred then
@@ -628,7 +631,7 @@ end
 
 local cacheDirty = false
 
-local function saveLocalRaw(raw, unsynced)
+function saveLocalRaw(raw, unsynced)
     local encoded, reason = atlas.encodeTile(raw)
     if not encoded then return false, reason end
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
@@ -660,7 +663,7 @@ local function saveLocalRaw(raw, unsynced)
     return true
 end
 
-local function queueLocalSave(raw, unsynced, background)
+function queueLocalSave(raw, unsynced, background)
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
     local pending = cacheWriteQueue[key]
     cacheWriteQueue[key] = {
@@ -675,7 +678,7 @@ local function queueLocalSave(raw, unsynced, background)
     }
 end
 
-local function loadLocalRaw(dimension, chunkX, chunkZ)
+function loadLocalRaw(dimension, chunkX, chunkZ)
     local key = tileKey(dimension, chunkX, chunkZ)
     local entry = cacheIndex.tiles[key]
     local path = cacheEntryPath(entry)
@@ -711,7 +714,7 @@ local function loadLocalRaw(dimension, chunkX, chunkZ)
     return raw
 end
 
-local function queueUpload(raw)
+function queueUpload(raw)
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
     uploadQueue[key] = atlas.copyTile(raw)
     local entry = cacheIndex.tiles[key]
@@ -725,7 +728,7 @@ local function queueUpload(raw)
     if retry and retry.checksum ~= raw.checksum then uploadRetry[key] = nil end
 end
 
-local function markSynced(raw)
+function markSynced(raw)
     local key = tileKey(raw.dimension, raw.chunkX, raw.chunkZ)
     local entry = cacheIndex.tiles[key]
     if entry and entry.checksum == raw.checksum then
@@ -743,7 +746,7 @@ local function markSynced(raw)
     serverVerifiedAt[key] = nowMs()
 end
 
-local function queueDownload(
+function queueDownload(
         dimension, chunkX, chunkZ, priority, verifyExisting, cacheOnly)
     if not serverId then return false end
     local key = tileKey(dimension, chunkX, chunkZ)
@@ -802,7 +805,7 @@ local function queueDownload(
     return false
 end
 
-local function discoverStations()
+function discoverStations()
     local found = {}
     local ids = { rednet.lookup(atlas.PROTOCOL_DISCOVERY, nil, 1) }
     local requests = {}
@@ -836,13 +839,13 @@ local function discoverStations()
     return found
 end
 
-local function fitTerminal(text, width)
+function fitTerminal(text, width)
     text = tostring(text)
     if #text <= width then return text end
     return text:sub(1, math.max(0, width - 1)) .. "~"
 end
 
-local function chooseStation(hasWireless)
+function chooseStation(hasWireless)
     if not hasWireless then return nil, nil end
     local stations = discoverStations()
     local selected = #stations > 0 and 1 or 0
@@ -977,11 +980,11 @@ for index, zoom in ipairs(ZOOM_LEVELS) do
     if zoom == INITIAL_ZOOM then zoomIndex = index end
 end
 
-local function zoom()
+function zoom()
     return ZOOM_LEVELS[zoomIndex]
 end
 
-local function getSample(worldX, worldZ, dimension)
+function getSample(worldX, worldZ, dimension)
     local chunkX = math.floor(worldX / 16)
     local chunkZ = math.floor(worldZ / 16)
     local tile = tiles[tileKey(dimension, chunkX, chunkZ)]
@@ -994,7 +997,7 @@ local function getSample(worldX, worldZ, dimension)
         tile.fluid[sample], tile.flags[sample]
 end
 
-local function inspectMapPoint(mouseX, mouseY)
+function inspectMapPoint(mouseX, mouseY)
     local display = lastDisplayMap
     if not display or not info
         or mouseY < display.mapTop
@@ -1027,7 +1030,7 @@ local function inspectMapPoint(mouseX, mouseY)
     return true
 end
 
-local function invalidateTileDependencies(dimension, chunkX, chunkZ)
+function invalidateTileDependencies(dimension, chunkX, chunkZ)
     local affected = {
         { chunkX, chunkZ },
         { chunkX - 1, chunkZ },
@@ -1044,12 +1047,12 @@ local function invalidateTileDependencies(dimension, chunkX, chunkZ)
     mapCache.signature = nil
 end
 
-local function invalidateRenderStyle()
+function invalidateRenderStyle()
     renderStyleVersion = renderStyleVersion + 1
     mapCache.signature = nil
 end
 
-local function installRawTile(raw, source)
+function installRawTile(raw, source)
     local decoded = decodeTile(raw)
     local key = tileKey(decoded.dimension, decoded.chunkX, decoded.chunkZ)
     local previous = tiles[key]
@@ -1082,7 +1085,7 @@ local function installRawTile(raw, source)
     return decoded
 end
 
-local function loadCachedTileIfPresent(dimension, chunkX, chunkZ)
+function loadCachedTileIfPresent(dimension, chunkX, chunkZ)
     local key = tileKey(dimension, chunkX, chunkZ)
     if tiles[key] then
         local entry = cacheIndex.tiles[key]
@@ -1098,7 +1101,7 @@ local function loadCachedTileIfPresent(dimension, chunkX, chunkZ)
     return true
 end
 
-local function scanDirection()
+function scanDirection()
     local waypoint = nextWaypoint()
     if info and waypoint then
         local dx = waypoint.x - info.x
@@ -1110,7 +1113,7 @@ local function scanDirection()
     return math.sin(radians), -math.cos(radians)
 end
 
-local function rebuildScanPlan(infoValue)
+function rebuildScanPlan(infoValue)
     local directionX, directionZ = scanDirection()
     local radius = infoValue.maxChunkRadius
     local highSpeed = motion.speed >= 8
@@ -1173,7 +1176,7 @@ local function rebuildScanPlan(infoValue)
     scanOffsets = offsets
 end
 
-local function prepareScanPlan(infoValue)
+function prepareScanPlan(infoValue)
     local waypoint = nextWaypoint()
     local direction = math.floor((motion.track or 0) / 15)
     local speedBand = math.floor((motion.speed or 0) / 4)
@@ -1195,7 +1198,7 @@ local function prepareScanPlan(infoValue)
     end
 end
 
-local function chooseScanBatch(infoValue, maximum)
+function chooseScanBatch(infoValue, maximum)
     prepareScanPlan(infoValue)
     local currentTime = nowMs()
     local waitingForSharedMap = false
@@ -1256,14 +1259,14 @@ local function chooseScanBatch(infoValue, maximum)
     return selected, selectedKeys, waitingForSharedMap
 end
 
-local function recordCompletedScans(count)
+function recordCompletedScans(count)
     local timestamp = nowMs()
     for _ = 1, count do
         scanMetrics.completedAt[#scanMetrics.completedAt + 1] = timestamp
     end
 end
 
-local function updateScanTelemetry(infoValue)
+function updateScanTelemetry(infoValue)
     local currentTime = nowMs()
     while scanMetrics.completedAt[1]
         and currentTime - scanMetrics.completedAt[1]
@@ -1291,7 +1294,7 @@ local function updateScanTelemetry(infoValue)
         and ahead * 16 / motion.speed or 0
 end
 
-local function scanLegacy(infoValue)
+function scanLegacy(infoValue)
     for _ = 1, 4 do
         local selected, _, waitingForSharedMap =
             chooseScanBatch(infoValue, 1)
@@ -1318,7 +1321,7 @@ local function scanLegacy(infoValue)
     scanStatus = "LEGACY SCAN"
 end
 
-local function markBatchOffsetsForRetry(
+function markBatchOffsetsForRetry(
         entries, originChunkX, originChunkZ, delay)
     if type(entries) ~= "table" then return end
     for _, offset in ipairs(entries) do
@@ -1338,7 +1341,7 @@ local function markBatchOffsetsForRetry(
     end
 end
 
-local function scanAvailable(infoValue)
+function scanAvailable(infoValue)
     if infoValue.ready == false then
         scanStatus = "SCANNER BUSY"
         return
@@ -1427,7 +1430,7 @@ local function scanAvailable(infoValue)
     updateScanTelemetry(infoValue)
 end
 
-local function tileSampleColor(tile, eastTile, southTile, localX, localZ)
+function tileSampleColor(tile, eastTile, southTile, localX, localZ)
     local sample = localZ * 16 + localX + 1
     local surface = tile.surface[sample]
     local clearance = tile.clearance[sample]
@@ -1493,7 +1496,7 @@ local function tileSampleColor(tile, eastTile, southTile, localX, localZ)
     return color
 end
 
-local function renderedPixelsFor(tile)
+function renderedPixelsFor(tile)
     if tile.renderPixels and tile.renderStyleVersion == renderStyleVersion then
         return tile.renderPixels
     end
@@ -1514,13 +1517,13 @@ local function renderedPixelsFor(tile)
     return tile.renderPixels
 end
 
-local function drawPixel(x, y, color, width, height)
+function drawPixel(x, y, color, width, height)
     if x >= 0 and x < width and y >= 0 and y < height then
         term.setPixel(x, y, color)
     end
 end
 
-local function drawText(x, y, text, color, width, height)
+function drawText(x, y, text, color, width, height)
     text = tostring(text):upper()
     for characterIndex = 1, #text do
         local glyph = FONT[text:sub(characterIndex, characterIndex)] or FONT["?"]
@@ -1536,13 +1539,13 @@ local function drawText(x, y, text, color, width, height)
     end
 end
 
-local function fitText(text, width)
+function fitText(text, width)
     local maximum = math.max(0, math.floor((width - 4) / 4))
     if #text <= maximum then return text end
     return text:sub(1, math.max(0, maximum - 1)) .. "?"
 end
 
-local function drawToolbarButton(
+function drawToolbarButton(
         buttons, x, y, label, action, width, height)
     local buttonWidth = #label * 4 + 7
     term.drawPixels(x, y, COLOR.panelEdge, buttonWidth, 7)
@@ -1557,7 +1560,7 @@ local function drawToolbarButton(
     return x + buttonWidth + 2
 end
 
-local function drawAircraft(
+function drawAircraft(
         screenX, screenY, heading, width, height, warning)
     local edge = COLOR.aircraftEdge
     local fill = warning and COLOR.warning or COLOR.aircraft
@@ -1583,7 +1586,7 @@ local function drawAircraft(
     end
 end
 
-local function drawLine(x0, y0, x1, y1, color, width, height)
+function drawLine(x0, y0, x1, y1, color, width, height)
     x0, y0 = math.floor(x0 + 0.5), math.floor(y0 + 0.5)
     x1, y1 = math.floor(x1 + 0.5), math.floor(y1 + 0.5)
     local dx = math.abs(x1 - x0)
@@ -1606,14 +1609,14 @@ local function drawLine(x0, y0, x1, y1, color, width, height)
     end
 end
 
-local function worldToScreen(
+function worldToScreen(
         worldX, worldZ, mapViewX, mapViewZ,
         pixelsPerBlock, centerX, centerY, mapTop)
     return centerX + (worldX - mapViewX) * pixelsPerBlock,
         mapTop + centerY + (worldZ - mapViewZ) * pixelsPerBlock
 end
 
-local function drawNavigationOverlay(
+function drawNavigationOverlay(
         width, height, mapTop, mapHeight, pixelsPerBlock,
         mapViewX, mapViewZ, centerX, centerY)
     local previousX = info.x
@@ -1657,7 +1660,7 @@ local function drawNavigationOverlay(
     end
 end
 
-local function buildMapRows(request)
+function buildMapRows(request)
     local width = request.width
     local mapHeight = request.mapHeight
     local pixelsPerBlock = request.pixelsPerBlock
@@ -1733,7 +1736,7 @@ local function buildMapRows(request)
     return rows
 end
 
-local function blankRows(width, height)
+function blankRows(width, height)
     local key = width .. ":" .. height
     local rows = blankRowsCache[key]
     if rows then return rows end
@@ -1745,14 +1748,14 @@ local function blankRows(width, height)
     return rows
 end
 
-local function requestMapBuild(request)
+function requestMapBuild(request)
     if mapCache.signature == request.signature then return end
     if mapBuildRequest and mapBuildRequest.signature == request.signature then return end
     mapBuildRequest = request
     os.queueEvent(MAP_BUILD_EVENT)
 end
 
-local function render()
+function render()
     if not info then return end
 
     if follow then
@@ -1927,20 +1930,20 @@ local function render()
     term.setFrozen(false)
 end
 
-local function changeZoom(direction)
+function changeZoom(direction)
     local previous = zoomIndex
     zoomIndex = clamp(zoomIndex + direction, 1, #ZOOM_LEVELS)
     if zoomIndex ~= previous then invalidateRenderStyle() end
 end
 
-local function pan(dx, dz)
+function pan(dx, dz)
     follow = false
     local amount = math.max(1, math.floor(24 / zoom()))
     viewX = viewX + dx * amount
     viewZ = viewZ + dz * amount
 end
 
-local function returnHomeView()
+function returnHomeView()
     follow = true
     pointerDetails = nil
     if info then
@@ -1949,7 +1952,7 @@ local function returnHomeView()
     end
 end
 
-local function refreshInfo()
+function refreshInfo()
     local ok, result = pcall(surveyor.getInfo)
     if not ok then
         scanStatus = "NO SENSOR"
@@ -1997,7 +2000,7 @@ local function refreshInfo()
     return true
 end
 
-local function sendPending(operation, payload, pending)
+function sendPending(operation, payload, pending)
     if not serverId then return false end
     local requestId = atlas.requestId()
     payload.requestId = requestId
@@ -2015,7 +2018,7 @@ local function sendPending(operation, payload, pending)
     return true
 end
 
-local function processCatalogMirror()
+function processCatalogMirror()
     if not serverId or linkStatus == "LOST" or catalogState.pending then return end
     local capabilities = serverInfo
         and type(serverInfo.capabilities) == "table"
@@ -2037,7 +2040,7 @@ local function processCatalogMirror()
     if sent then catalogState.pending = true end
 end
 
-local function acceptCatalogPage(message)
+function acceptCatalogPage(message)
     catalogState.pending = false
     if type(message.entries) ~= "table"
         or type(message.revision) ~= "number" then
@@ -2110,7 +2113,7 @@ local function acceptCatalogPage(message)
     end
 end
 
-local function scheduleUploadRetry(request, reason)
+function scheduleUploadRetry(request, reason)
     if not request or not request.key or not request.tile then return end
     local previous = uploadRetry[request.key]
     local attempts = previous and previous.checksum == request.tile.checksum
@@ -2125,7 +2128,7 @@ local function scheduleUploadRetry(request, reason)
     scanStatus = ("SYNC RETRY %ds"):format(math.ceil(delay / 1000))
 end
 
-local function nextQueuedDownload()
+function nextQueuedDownload()
     local choiceKey
     local choice
     for key, request in pairs(downloadQueue) do
@@ -2138,7 +2141,7 @@ local function nextQueuedDownload()
     return choiceKey, choice
 end
 
-local function nextQueuedDownloads(limit)
+function nextQueuedDownloads(limit)
     local choices = {}
     for key, request in pairs(downloadQueue) do
         if not pendingKeys[key]
@@ -2156,7 +2159,7 @@ local function nextQueuedDownloads(limit)
     return choices
 end
 
-local function processNetworkQueue()
+function processNetworkQueue()
     if not serverId or linkStatus == "LOST" then return end
 
     local capabilities = serverInfo
@@ -2315,7 +2318,7 @@ local function processNetworkQueue()
     end
 end
 
-local function clearPending(request)
+function clearPending(request)
     pendingNetwork[request.requestId] = nil
     if request.key and pendingKeys[request.key] == request.requestId then
         pendingKeys[request.key] = nil
@@ -2329,7 +2332,7 @@ local function clearPending(request)
     end
 end
 
-local function acceptNetworkTile(raw, request)
+function acceptNetworkTile(raw, request)
     if request and request.cacheOnly then
         local valid = atlas.validateTile(raw)
         if not valid then return false end
@@ -2351,7 +2354,7 @@ local function acceptNetworkTile(raw, request)
     return ok
 end
 
-local function handleDownloadItem(item, key, request)
+function handleDownloadItem(item, key, request)
     if item.status == "data" and item.tile then
         local ok = acceptNetworkTile(item.tile, request)
         if ok then downloadQueue[key] = nil end
@@ -2375,7 +2378,7 @@ local function handleDownloadItem(item, key, request)
     end
 end
 
-local function handleNetworkMessage(sender, message)
+function handleNetworkMessage(sender, message)
     if sender ~= serverId or type(message) ~= "table"
         or message.atlas ~= atlas.VERSION then return end
     lastServerSeen = nowMs()
@@ -2534,7 +2537,7 @@ local function handleNetworkMessage(sender, message)
     end
 end
 
-local function expireNetworkRequests()
+function expireNetworkRequests()
     local currentTime = nowMs()
     for _, request in pairs(pendingNetwork) do
         if currentTime - request.sentAt > NETWORK_TIMEOUT_MS then
@@ -2556,7 +2559,7 @@ local function expireNetworkRequests()
     end
 end
 
-local function heartbeat()
+function heartbeat()
     if not serverId or not info then return end
     atlas.send(serverId, "heartbeat", {
         callsign = navConfig.callsign,
@@ -2571,14 +2574,14 @@ local function heartbeat()
     })
 end
 
-local function requestTraffic()
+function requestTraffic()
     if not serverId then return end
     sendPending("traffic_request", {}, {
         type = "traffic"
     })
 end
 
-local function queueCorridor(
+function queueCorridor(
         dimension, fromChunkX, fromChunkZ, toChunkX, toChunkZ, basePriority)
     local dx = toChunkX - fromChunkX
     local dz = toChunkZ - fromChunkZ
@@ -2597,7 +2600,7 @@ local function queueCorridor(
     end
 end
 
-local function queueVisibleMap()
+function queueVisibleMap()
     local display = lastDisplayMap
     if not display or not info then return end
 
@@ -2696,7 +2699,7 @@ local function queueVisibleMap()
     end
 end
 
-local function refreshPrefetch()
+function refreshPrefetch()
     if not info or not serverId then return end
     local chunkX = math.floor(info.x / 16)
     local chunkZ = math.floor(info.z / 16)
@@ -2751,7 +2754,7 @@ local function refreshPrefetch()
     queueVisibleMap()
 end
 
-local function cacheTileDistance(key)
+function cacheTileDistance(key)
     local dimension, chunkX, chunkZ =
         key:match("^(.-)|(-?%d+)|(-?%d+)$")
     chunkX, chunkZ = tonumber(chunkX), tonumber(chunkZ)
@@ -2772,7 +2775,7 @@ local function cacheTileDistance(key)
     return best
 end
 
-local function evictCacheIfNeeded(extraBytes)
+function evictCacheIfNeeded(extraBytes)
     refreshCacheVolumes(false)
     extraBytes = math.max(0, tonumber(extraBytes) or 0)
     local currentTime = nowMs()
@@ -2830,7 +2833,7 @@ local function evictCacheIfNeeded(extraBytes)
     end
 end
 
-local function networkLoop()
+function networkLoop()
     local timer = os.startTimer(NETWORK_TICK_SECONDS)
     local lastHeartbeat = 0
     local lastTraffic = 0
@@ -2869,7 +2872,7 @@ local function networkLoop()
     end
 end
 
-local function cacheLoop()
+function cacheLoop()
     local lastPrefetch = 0
     local lastMaintenance = 0
     while running do
@@ -2929,7 +2932,7 @@ local function cacheLoop()
     end
 end
 
-local function mapBuilderLoop()
+function mapBuilderLoop()
     while running do
         if not waitForRawEvent(MAP_BUILD_EVENT) then return end
         while running do
@@ -2958,21 +2961,21 @@ local function mapBuilderLoop()
     end
 end
 
-local function sensorLoop()
+function sensorLoop()
     while running do
         refreshInfo()
         if not waitSeconds(UPDATE_SECONDS) then return end
     end
 end
 
-local function displayLoop()
+function displayLoop()
     while running do
         if not modal then render() end
         if not waitSeconds(UPDATE_SECONDS) then return end
     end
 end
 
-local function addWaypoint(worldX, worldZ, altitude, name)
+function addWaypoint(worldX, worldZ, altitude, name)
     waypoints[#waypoints + 1] = {
         name = name or ("WP" .. (#waypoints + 1)),
         x = math.floor(worldX + 0.5),
@@ -2987,7 +2990,7 @@ local function addWaypoint(worldX, worldZ, altitude, name)
         waypoints[#waypoints].name or ("WP" .. #waypoints))
 end
 
-local function removeWaypoint(index)
+function removeWaypoint(index)
     if not waypoints[index] then return false end
     local removed = table.remove(waypoints, index)
     if #waypoints == 0 then
@@ -3003,7 +3006,7 @@ local function removeWaypoint(index)
     return true
 end
 
-local function waypointAtPointer(mouseX, mouseY, display)
+function waypointAtPointer(mouseX, mouseY, display)
     local bestIndex
     local bestDistance = 9
     for index, waypoint in ipairs(waypoints) do
@@ -3022,7 +3025,7 @@ local function waypointAtPointer(mouseX, mouseY, display)
     return bestIndex
 end
 
-local function waypointEditor()
+function waypointEditor()
     modal = true
     pcall(term.setFrozen, false)
     pcall(term.setGraphicsMode, false)
@@ -3061,7 +3064,7 @@ local function waypointEditor()
     modal = false
 end
 
-local function openHomeMenu()
+function openHomeMenu()
     modal = true
     pcall(term.setFrozen, false)
     pcall(term.setGraphicsMode, false)
@@ -3108,7 +3111,7 @@ local function openHomeMenu()
     modal = false
 end
 
-local function performNavAction(action)
+function performNavAction(action)
     if action == "zoom_in" then
         changeZoom(1)
     elseif action == "zoom_out" then
@@ -3130,7 +3133,7 @@ local function performNavAction(action)
     end
 end
 
-local function inputLoop()
+function inputLoop()
     while running do
         local event = { os.pullEventRaw() }
         local eventName = event[1]
@@ -3246,7 +3249,7 @@ local function inputLoop()
     end
 end
 
-local function main()
+function main()
     math.randomseed(atlas.now() + os.getComputerID())
     restoreTextPalette()
     atlas.writeTable(NAV_CONFIG_PATH, navConfig)
