@@ -22,7 +22,7 @@ return {
             file = "allay/atlas-navigator.lua"
         },
         ["atlas-companion"] = {
-            version = "1.0.2",
+            version = "1.0.3",
             description = "Paired pocket moving map and live aircraft route controller",
             file = "allay/atlas-companion.lua"
         }

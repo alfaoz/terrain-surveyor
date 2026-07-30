@@ -310,6 +310,9 @@ client-only and remains dormant when CC: Graphics is absent.
 The companion composes each screen off-screen and publishes one atomic frame.
 Fullscreen or GUI-size changes discard the old layout and trigger a complete
 map rebuild instead of exposing a partially drawn terrain layer.
+Its active tile-request queue is a bounded, center-out window over the visible
+map. Panning or zooming immediately prunes obsolete requests, while tiles that
+have already arrived remain in the persistent on-device cache.
 
 Companion controls:
 

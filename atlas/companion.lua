@@ -13,6 +13,7 @@ STATE_REQUEST_MS = 800
 STATE_LOST_MS = 3500
 TILE_TIMEOUT_MS = 3000
 TILE_BATCH_SIZE = 14
+MAX_TILE_QUEUE = 512
 VISIBLE_INSPECTIONS = 256
 MAP_EVENT = "atlas_companion_map"
 HEADER_HEIGHT = 15
@@ -72,7 +73,9 @@ for byte = 0, 255 do BYTE[byte] = string.char(byte) end
 
 config = atlas.readTable(CONFIG_PATH) or {}
 tiles = {}
+tileCount = 0
 wantedTiles = {}
+wantedTileCount = 0
 tilePending = nil
 missingUntil = {}
 terrainRevision = 0
@@ -203,6 +206,83 @@ function tileKey(dimension, chunkX, chunkZ)
     return atlas.tileKey(dimension, chunkX, chunkZ)
 end
 
+function removeWantedTile(key)
+    if not wantedTiles[key] then return false end
+    wantedTiles[key] = nil
+    wantedTileCount = math.max(0, wantedTileCount - 1)
+    return true
+end
+
+function clearWantedTiles()
+    wantedTiles = {}
+    wantedTileCount = 0
+    tilePending = nil
+end
+
+function queueWantedTile(key, request)
+    local existing = wantedTiles[key]
+    if existing then
+        existing.priority = math.min(
+            existing.priority or math.huge,
+            request.priority or math.huge)
+        return true
+    end
+    if wantedTileCount >= MAX_TILE_QUEUE then return false end
+    wantedTiles[key] = request
+    wantedTileCount = wantedTileCount + 1
+    return true
+end
+
+function wantedTileInViewport(request, plan)
+    return request.dimension == plan.dimension
+        and request.chunkX >= plan.minX
+        and request.chunkX <= plan.maxX
+        and request.chunkZ >= plan.minZ
+        and request.chunkZ <= plan.maxZ
+end
+
+function pruneWantedTiles(plan)
+    for key, request in pairs(wantedTiles) do
+        if not wantedTileInViewport(request, plan) then
+            removeWantedTile(key)
+        end
+    end
+end
+
+function resetViewportCursor(plan)
+    plan.spiralX = 0
+    plan.spiralZ = 0
+    plan.directionX = 1
+    plan.directionZ = 0
+    plan.segmentLength = 1
+    plan.segmentProgress = 0
+    plan.segmentsAtLength = 0
+    plan.spiralSteps = 0
+end
+
+function nextViewportChunk(plan)
+    if plan.spiralSteps >= plan.maxSpiralSteps then
+        resetViewportCursor(plan)
+    end
+    local chunkX = plan.centerX + plan.spiralX
+    local chunkZ = plan.centerZ + plan.spiralZ
+    plan.spiralX = plan.spiralX + plan.directionX
+    plan.spiralZ = plan.spiralZ + plan.directionZ
+    plan.segmentProgress = plan.segmentProgress + 1
+    plan.spiralSteps = plan.spiralSteps + 1
+    if plan.segmentProgress >= plan.segmentLength then
+        plan.segmentProgress = 0
+        plan.directionX, plan.directionZ =
+            -plan.directionZ, plan.directionX
+        plan.segmentsAtLength = plan.segmentsAtLength + 1
+        if plan.segmentsAtLength >= 2 then
+            plan.segmentsAtLength = 0
+            plan.segmentLength = plan.segmentLength + 1
+        end
+    end
+    return chunkX, chunkZ
+end
+
 function cachePath(dimension, chunkX, chunkZ)
     local regionX = math.floor(chunkX / 32)
     local regionZ = math.floor(chunkZ / 32)
@@ -299,7 +379,8 @@ function installTile(raw, save)
     local key = tileKey(tile.dimension, tile.chunkX, tile.chunkZ)
     local previous = tiles[key]
     tiles[key] = tile
-    wantedTiles[key] = nil
+    if not previous then tileCount = tileCount + 1 end
+    removeWantedTile(key)
     missingUntil[key] = nil
     if not previous or previous.checksum ~= tile.checksum then
         terrainRevision = terrainRevision + 1
@@ -380,6 +461,8 @@ function acceptConnection(identifier, message)
         or type(message.session) ~= "string" then return false end
     navigatorId = identifier
     session = message.session
+    clearWantedTiles()
+    viewportPlan = nil
     connected = true
     stateReceivedAt = now()
     if type(message.state) == "table" then state = message.state end
@@ -907,7 +990,7 @@ function handleTiles(message)
                 local wanted = wantedTiles[key]
                 if wanted then wanted.notBefore = current + 400 end
             else
-                wantedTiles[key] = nil
+                removeWantedTile(key)
                 missingUntil[key] = current
                     + (item.status == "unavailable" and 3000 or 15000)
             end
@@ -965,51 +1048,56 @@ function prepareViewport()
     local maximumChunkX = math.floor(maximumX / 16) + 1
     local minimumChunkZ = math.floor(minimumZ / 16) - 1
     local maximumChunkZ = math.floor(maximumZ / 16) + 1
+    local centerChunkX = math.floor(display.mapViewX / 16)
+    local centerChunkZ = math.floor(display.mapViewZ / 16)
+    local maximumRadius = math.max(
+        math.abs(minimumChunkX - centerChunkX),
+        math.abs(maximumChunkX - centerChunkX),
+        math.abs(minimumChunkZ - centerChunkZ),
+        math.abs(maximumChunkZ - centerChunkZ))
     local signature = table.concat({
         craft.dimension, minimumChunkX, maximumChunkX,
-        minimumChunkZ, maximumChunkZ
+        minimumChunkZ, maximumChunkZ, centerChunkX, centerChunkZ
     }, ":")
     if viewportPlan and viewportPlan.signature == signature then return end
-    viewportPlan = {
+    local nextPlan = {
         signature = signature,
         dimension = craft.dimension,
         minX = minimumChunkX,
         maxX = maximumChunkX,
         minZ = minimumChunkZ,
         maxZ = maximumChunkZ,
-        x = minimumChunkX,
-        z = minimumChunkZ
+        centerX = centerChunkX,
+        centerZ = centerChunkZ,
+        maxSpiralSteps = (maximumRadius * 2 + 1) ^ 2
     }
+    resetViewportCursor(nextPlan)
+    pruneWantedTiles(nextPlan)
+    viewportPlan = nextPlan
 end
 
 function inspectViewport()
     prepareViewport()
     if not viewportPlan then return end
-    local craft = aircraft()
-    local centerChunkX = craft and math.floor(craft.x / 16) or 0
-    local centerChunkZ = craft and math.floor(craft.z / 16) or 0
     for _ = 1, VISIBLE_INSPECTIONS do
+        if wantedTileCount >= MAX_TILE_QUEUE then break end
         local plan = viewportPlan
-        local chunkX = plan.x
-        local chunkZ = plan.z
-        local key = tileKey(plan.dimension, chunkX, chunkZ)
-        if not tiles[key] and now() >= (missingUntil[key] or 0) then
-            if not loadCachedTile(plan.dimension, chunkX, chunkZ) then
-                wantedTiles[key] = wantedTiles[key] or {
-                    dimension = plan.dimension,
-                    chunkX = chunkX,
-                    chunkZ = chunkZ,
-                    priority = (chunkX - centerChunkX) ^ 2
-                        + (chunkZ - centerChunkZ) ^ 2,
-                    notBefore = 0
-                }
+        local chunkX, chunkZ = nextViewportChunk(plan)
+        if chunkX >= plan.minX and chunkX <= plan.maxX
+            and chunkZ >= plan.minZ and chunkZ <= plan.maxZ then
+            local key = tileKey(plan.dimension, chunkX, chunkZ)
+            if not tiles[key] and now() >= (missingUntil[key] or 0) then
+                if not loadCachedTile(plan.dimension, chunkX, chunkZ) then
+                    queueWantedTile(key, {
+                        dimension = plan.dimension,
+                        chunkX = chunkX,
+                        chunkZ = chunkZ,
+                        priority = (chunkX - plan.centerX) ^ 2
+                            + (chunkZ - plan.centerZ) ^ 2,
+                        notBefore = 0
+                    })
+                end
             end
-        end
-        plan.x = plan.x + 1
-        if plan.x > plan.maxX then
-            plan.x = plan.minX
-            plan.z = plan.z + 1
-            if plan.z > plan.maxZ then plan.z = plan.minZ end
         end
     end
 end
@@ -1662,7 +1750,7 @@ function renderFrame()
     drawText(2, footerY, fitText(detail or routeLine, width),
         nextPoint and COLOR.text or COLOR.textDim, width, height)
     local cacheLine = ("MAP:%d QUEUE:%d POI:%d REV:%d %s"):format(
-        count(tiles), count(wantedTiles), #pois(),
+        tileCount, wantedTileCount, #pois(),
         tonumber(routeValue.revision) or 0, statusText)
     drawText(2, footerY + 7, fitText(cacheLine, width),
         COLOR.textDim, width, height)
