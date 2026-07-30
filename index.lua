@@ -7,18 +7,18 @@ return {
 
     packages = {
         ["atlas-core"] = {
-            version = "1.1.0",
+            version = "1.2.0",
             description = "Shared ATLAS protocol and terrain storage library",
             file = "allay/atlas-core.lua"
         },
         ["atlas-station"] = {
-            version = "1.3.0",
-            description = "Shared terrain database, disk rack, and traffic server",
+            version = "1.4.0",
+            description = "Shared terrain and POI database, disk rack, and traffic server",
             file = "allay/atlas-station.lua"
         },
         ["atlas-navigator"] = {
-            version = "1.3.1",
-            description = "Shared CC:Graphics terrain and waypoint navigator",
+            version = "1.4.0",
+            description = "Shared CC:Graphics terrain, POI, and waypoint navigator",
             file = "allay/atlas-navigator.lua"
         }
     }

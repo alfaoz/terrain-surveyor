@@ -38,6 +38,7 @@ local CACHE_POLICY = {
 }
 local NAV_CONFIG_PATH = "/atlas/navigator.cfg"
 local ROUTE_PATH = "/atlas/route.dat"
+local POI_CACHE_PATH = "/atlas/pois.dat"
 local MAP_BUILD_ROWS_PER_YIELD = 12
 local MAP_BUILD_EVENT = "terrain_map_build"
 local MAP_BUILD_STEP_EVENT = "terrain_map_build_step"
@@ -82,6 +83,7 @@ local COLOR = {
     route = 15,
     waypoint = 16,
     traffic = 17,
+    poi = 18,
     terrainFirst = 32
 }
 
@@ -187,6 +189,7 @@ function configurePalette()
     setPalette(COLOR.route, { 224, 181, 92 })
     setPalette(COLOR.waypoint, { 238, 221, 159 })
     setPalette(COLOR.traffic, { 105, 183, 184 })
+    setPalette(COLOR.poi, { 210, 151, 221 })
 
     local low = { 68, 103, 77 }
     local middle = { 132, 135, 99 }
@@ -305,6 +308,18 @@ local waypoints = type(routeData.waypoints) == "table"
     and routeData.waypoints or {}
 local activeWaypoint = math.max(1, tonumber(routeData.active) or 1)
 
+local poiCache = atlas.readTable(POI_CACHE_PATH) or {}
+local pois = {}
+for _, cachedPoi in ipairs(type(poiCache.pois) == "table"
+        and poiCache.pois or {}) do
+    if type(cachedPoi) == "table" and type(cachedPoi.id) == "string" then
+        pois[cachedPoi.id] = cachedPoi
+    end
+end
+local poiRevision = tonumber(poiCache.revision) or 0
+local poiSourceId = tonumber(poiCache.serverId)
+local selectedPoiId
+
 local cacheIndex = atlas.readTable(CACHE_META_PATH) or {}
 cacheIndex.tiles = type(cacheIndex.tiles) == "table" and cacheIndex.tiles or {}
 
@@ -398,6 +413,50 @@ end
 
 function nextWaypoint()
     return waypoints[activeWaypoint]
+end
+
+function poiArray()
+    local result = {}
+    for _, poi in pairs(pois) do result[#result + 1] = poi end
+    table.sort(result, function(a, b)
+        local aName = tostring(a.name or "")
+        local bName = tostring(b.name or "")
+        if aName == bName then return tostring(a.id) < tostring(b.id) end
+        return aName < bName
+    end)
+    return result
+end
+
+function savePoiCache()
+    return atlas.writeTable(POI_CACHE_PATH, {
+        format = 1,
+        revision = poiRevision,
+        serverId = serverId or poiSourceId,
+        pois = poiArray()
+    })
+end
+
+function validPoi(value)
+    return type(value) == "table"
+        and type(value.id) == "string"
+        and type(value.name) == "string"
+        and type(value.dimension) == "string"
+        and type(value.x) == "number"
+        and type(value.z) == "number"
+end
+
+function installPoiList(values, revision)
+    if type(values) ~= "table" then return false end
+    local replacement = {}
+    for _, poi in ipairs(values) do
+        if validPoi(poi) then replacement[poi.id] = poi end
+    end
+    pois = replacement
+    poiRevision = tonumber(revision) or poiRevision
+    poiSourceId = serverId or poiSourceId
+    if selectedPoiId and not pois[selectedPoiId] then selectedPoiId = nil end
+    savePoiCache()
+    return true
 end
 
 function bearingBetween(x1, z1, x2, z2)
@@ -1641,6 +1700,32 @@ function drawNavigationOverlay(
         previousX, previousZ = waypoint.x, waypoint.z
     end
 
+    for id, poi in pairs(pois) do
+        if poi.dimension == info.dimension then
+            local x, y = worldToScreen(
+                poi.x, poi.z, mapViewX, mapViewZ,
+                pixelsPerBlock, centerX, centerY, mapTop)
+            x, y = math.floor(x + 0.5), math.floor(y + 0.5)
+            for offset = -3, 3 do
+                local widthAtRow = 3 - math.abs(offset)
+                for across = -widthAtRow, widthAtRow do
+                    drawPixel(x + across, y + offset,
+                        COLOR.poi, width, height)
+                end
+            end
+            if id == selectedPoiId then
+                drawPixel(x, y - 5, COLOR.text, width, height)
+                drawPixel(x - 5, y, COLOR.text, width, height)
+                drawPixel(x + 5, y, COLOR.text, width, height)
+                drawPixel(x, y + 5, COLOR.text, width, height)
+            end
+            if pixelsPerBlock >= 0.5 or id == selectedPoiId then
+                drawText(x + 6, y - 2,
+                    poi.name or "POI", COLOR.poi, width, height)
+            end
+        end
+    end
+
     for id, contact in pairs(traffic) do
         if id ~= os.getComputerID()
             and contact.dimension == info.dimension
@@ -1873,9 +1958,10 @@ function render()
         width, height)
     local stationTiles = serverInfo and serverInfo.tiles or "?"
     local status = (
-        "CACHE:%d/%s V:%d FREE:%s UP:%d DOWN:%d WRITE:%d NET:%s"):format(
+        "CACHE:%d/%s POI:%d V:%d FREE:%s UP:%d DOWN:%d WRITE:%d NET:%s"):format(
         tableCount(cacheIndex.tiles), tostring(stationTiles),
-        cacheStorage.volumes, atlas.formatBytes(cacheStorage.free),
+        tableCount(pois), cacheStorage.volumes,
+        atlas.formatBytes(cacheStorage.free),
         tableCount(uploadQueue), tableCount(downloadQueue),
         tableCount(cacheWriteQueue), linkStatus)
     local scannerStatus = (
@@ -1899,6 +1985,12 @@ function render()
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "WP", "waypoint", width, height)
     toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "POI", "poi", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "GO", "poi_route", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "PDEL", "poi_delete", width, height)
+    toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "NEXT", "next", width, height)
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "DEL", "delete", width, height)
@@ -1907,7 +1999,8 @@ function render()
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "HOME", "home", width, height)
     drawText(toolbarX + 2, footerY + 14,
-        fitText("LCLICK ADD  RCLICK WP DELETE", width - toolbarX - 2),
+        fitText("LCLICK WP  MCLICK POI  CLICK POI SELECT",
+            width - toolbarX - 2),
         COLOR.textDim, width, height)
     lastDisplayMap.buttons = toolbarButtons
 
@@ -2433,7 +2526,45 @@ function handleNetworkMessage(sender, message)
     end
     clearPending(pending)
 
-    if pending.type == "upload_batch" then
+    if pending.type == "poi_list" then
+        if message.op == "pois_current" then
+            poiSourceId = serverId
+            scanStatus = ("SHARED POIS CURRENT:%d"):format(tableCount(pois))
+        elseif message.op == "pois_data"
+            and installPoiList(message.pois, message.revision) then
+            scanStatus = ("SHARED POIS SYNCED:%d"):format(tableCount(pois))
+        else
+            scanStatus = "POI SYNC FAILED"
+        end
+    elseif pending.type == "poi_put" then
+        if message.op == "poi_stored" and validPoi(message.poi) then
+            pois[message.poi.id] = message.poi
+            poiRevision = tonumber(message.revision) or poiRevision
+            poiSourceId = serverId
+            savePoiCache()
+            selectPoi(message.poi.id)
+            scanStatus = "SHARED POI SAVED"
+        else
+            scanStatus = "POI SAVE FAILED: "
+                .. tostring(message.reason or message.op)
+        end
+    elseif pending.type == "poi_delete" then
+        if message.op == "poi_deleted" then
+            local deletedId = message.poiId or pending.poiId
+            if deletedId then pois[deletedId] = nil end
+            poiRevision = tonumber(message.revision) or poiRevision
+            poiSourceId = serverId
+            if selectedPoiId == deletedId then
+                selectedPoiId = nil
+                pointerDetails = nil
+            end
+            savePoiCache()
+            scanStatus = "SHARED POI DELETED"
+        else
+            scanStatus = "POI DELETE FAILED: "
+                .. tostring(message.reason or message.op)
+        end
+    elseif pending.type == "upload_batch" then
         local handled = {}
         if message.op == "tiles_stored"
             and type(message.items) == "table" then
@@ -2554,6 +2685,10 @@ function expireNetworkRequests()
             elseif request.type == "catalog" then
                 catalogState.pending = false
                 catalogState.nextAt = currentTime + 1000
+            elseif request.type == "poi_list"
+                or request.type == "poi_put"
+                or request.type == "poi_delete" then
+                scanStatus = "POI NETWORK TIMEOUT"
             end
         end
     end
@@ -2578,6 +2713,22 @@ function requestTraffic()
     if not serverId then return end
     sendPending("traffic_request", {}, {
         type = "traffic"
+    })
+end
+
+function requestPois()
+    if not serverId then return end
+    local capabilities = serverInfo
+        and type(serverInfo.capabilities) == "table"
+        and serverInfo.capabilities or {}
+    if not capabilities.sharedPois then return end
+    for _, pending in pairs(pendingNetwork) do
+        if pending.type == "poi_list" then return end
+    end
+    sendPending("get_pois", {
+        revision = poiSourceId == serverId and poiRevision or nil
+    }, {
+        type = "poi_list"
     })
 end
 
@@ -2837,6 +2988,7 @@ function networkLoop()
     local timer = os.startTimer(NETWORK_TICK_SECONDS)
     local lastHeartbeat = 0
     local lastTraffic = 0
+    local lastPois = 0
     local lastStationInfo = 0
     while running do
         local event = table.pack(os.pullEventRaw())
@@ -2858,6 +3010,10 @@ function networkLoop()
             if currentTime - lastTraffic >= TRAFFIC_MS then
                 requestTraffic()
                 lastTraffic = currentTime
+            end
+            if currentTime - lastPois >= 1000 then
+                requestPois()
+                lastPois = currentTime
             end
             if serverId
                 and currentTime - lastStationInfo >= STATION_INFO_MS then
@@ -3025,6 +3181,170 @@ function waypointAtPointer(mouseX, mouseY, display)
     return bestIndex
 end
 
+function poiAtPointer(mouseX, mouseY, display)
+    local bestId
+    local bestDistance = 11
+    for id, poi in pairs(pois) do
+        if not info or poi.dimension == info.dimension then
+            local screenX = display.centerX
+                + (poi.x - display.mapViewX) * display.pixelsPerBlock
+            local screenY = display.mapTop + display.centerY
+                + (poi.z - display.mapViewZ) * display.pixelsPerBlock
+            local dx = screenX - mouseX
+            local dy = screenY - mouseY
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance < bestDistance then
+                bestId = id
+                bestDistance = distance
+            end
+        end
+    end
+    return bestId
+end
+
+function selectPoi(identifier)
+    local poi = identifier and pois[identifier]
+    selectedPoiId = poi and identifier or nil
+    if poi then
+        pointerDetails = {
+            at = nowMs(),
+            x = poi.x,
+            z = poi.z,
+            text = ("POI %s [%s] X:%d%s Z:%d"):format(
+                poi.name or "POINT", poi.category or "GENERAL",
+                poi.x, poi.y and (" Y:" .. poi.y) or "", poi.z)
+        }
+    end
+    return poi
+end
+
+function enterTextModal(title)
+    modal = true
+    pcall(term.setFrozen, false)
+    pcall(term.setGraphicsMode, false)
+    restoreTextPalette()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print(title)
+    print()
+end
+
+function leaveTextModal()
+    local ok, failure = pcall(term.setGraphicsMode, 2)
+    if not ok then error(failure, 0) end
+    configurePalette()
+    invalidateRenderStyle()
+    modal = false
+end
+
+function poiEditor(identifier, seedX, seedZ)
+    if not serverId or linkStatus == "LOST" then
+        scanStatus = "POI REQUIRES STATION LINK"
+        return
+    end
+    local capabilities = serverInfo
+        and type(serverInfo.capabilities) == "table"
+        and serverInfo.capabilities or {}
+    if not capabilities.sharedPois then
+        scanStatus = "STATION NEEDS POI UPDATE"
+        return
+    end
+
+    local existing = identifier and pois[identifier]
+    local defaultX = existing and existing.x or seedX
+        or (pointerDetails and pointerDetails.x)
+        or (lastDisplayMap and lastDisplayMap.mapViewX)
+        or (info and info.x) or 0
+    local defaultZ = existing and existing.z or seedZ
+        or (pointerDetails and pointerDetails.z)
+        or (lastDisplayMap and lastDisplayMap.mapViewZ)
+        or (info and info.z) or 0
+    local defaultName = existing and existing.name
+        or ("POINT " .. (tableCount(pois) + 1))
+    local defaultCategory = existing and existing.category or "GENERAL"
+
+    enterTextModal(existing and "ATLAS EDIT SHARED POI"
+        or "ATLAS NEW SHARED POI")
+    print("Saved on " .. tostring(
+        serverInfo and serverInfo.name or "the selected station") .. ".")
+    print("Type ! for the name to cancel.")
+    print()
+    write("Name [" .. defaultName .. "]: ")
+    local name = read()
+    if name == "!" then
+        leaveTextModal()
+        return
+    end
+    if name == "" then name = defaultName end
+    write("Category [" .. defaultCategory .. "]: ")
+    local category = read()
+    if category == "" then category = defaultCategory end
+    write(("X [%d]: "):format(math.floor(defaultX + 0.5)))
+    local xText = read()
+    write(("Z [%d]: "):format(math.floor(defaultZ + 0.5)))
+    local zText = read()
+    local defaultY = existing and existing.y
+    write(defaultY and ("Altitude [" .. defaultY .. "], - clears: ")
+        or "Altitude (optional): ")
+    local yText = read()
+
+    local x = xText == "" and defaultX or tonumber(xText)
+    local z = zText == "" and defaultZ or tonumber(zText)
+    local y = yText == "-" and nil
+        or yText == "" and defaultY
+        or tonumber(yText)
+    if x and z and (yText == "" or yText == "-" or y) then
+        local sent = sendPending("put_poi", {
+            poi = {
+                id = existing and existing.id or nil,
+                name = name,
+                category = category,
+                dimension = existing and existing.dimension
+                    or (info and info.dimension) or "minecraft:overworld",
+                x = x,
+                y = y,
+                z = z
+            }
+        }, {
+            type = "poi_put"
+        })
+        scanStatus = sent and "SAVING SHARED POI" or "POI SEND FAILED"
+    else
+        scanStatus = "INVALID POI COORDINATES"
+    end
+    leaveTextModal()
+end
+
+function deleteSelectedPoi()
+    local poi = selectedPoiId and pois[selectedPoiId]
+    if not poi then
+        scanStatus = "SELECT A POI FIRST"
+        return
+    end
+    if not serverId or linkStatus == "LOST" then
+        scanStatus = "POI REQUIRES STATION LINK"
+        return
+    end
+    enterTextModal("DELETE SHARED POI")
+    print(("%s [%s] at X:%d Z:%d"):format(
+        poi.name, poi.category or "GENERAL", poi.x, poi.z))
+    print()
+    write("Delete it for every aircraft? [y/N]: ")
+    local confirmed = read():lower() == "y"
+    if confirmed then
+        local sent = sendPending("delete_poi", {
+            poiId = poi.id
+        }, {
+            type = "poi_delete",
+            poiId = poi.id
+        })
+        scanStatus = sent and "DELETING SHARED POI" or "POI SEND FAILED"
+    end
+    leaveTextModal()
+end
+
 function waypointEditor()
     modal = true
     pcall(term.setFrozen, false)
@@ -3118,6 +3438,17 @@ function performNavAction(action)
         changeZoom(-1)
     elseif action == "waypoint" then
         waypointEditor()
+    elseif action == "poi" then
+        poiEditor(selectedPoiId)
+    elseif action == "poi_route" then
+        local poi = selectedPoiId and pois[selectedPoiId]
+        if poi then
+            addWaypoint(poi.x, poi.z, poi.y, poi.name)
+        else
+            scanStatus = "SELECT A POI FIRST"
+        end
+    elseif action == "poi_delete" then
+        deleteSelectedPoi()
     elseif action == "next" then
         if activeWaypoint < #waypoints then
             activeWaypoint = activeWaypoint + 1
@@ -3158,6 +3489,13 @@ function inputLoop()
                 invalidateRenderStyle()
             elseif character == "w" then
                 waypointEditor()
+            elseif character == "p" then
+                performNavAction("poi")
+            elseif character == "e" then
+                if selectedPoiId then poiEditor(selectedPoiId)
+                else scanStatus = "SELECT A POI FIRST" end
+            elseif character == "k" then
+                deleteSelectedPoi()
             elseif character == "n" then
                 performNavAction("next")
             elseif character == "x" then
@@ -3209,10 +3547,30 @@ function inputLoop()
                     end
                 end
             end
+            if not handled and display
+                and mouseY >= display.mapTop
+                and mouseY < display.mapTop + display.mapHeight then
+                local poiId = poiAtPointer(mouseX, mouseY, display)
+                if poiId then
+                    selectPoi(poiId)
+                    handled = true
+                elseif button == 3 then
+                    local worldX = display.mapViewX
+                        + (mouseX - display.centerX)
+                            / display.pixelsPerBlock
+                    local worldZ = display.mapViewZ
+                        + (mouseY - display.mapTop - display.centerY)
+                            / display.pixelsPerBlock
+                    selectedPoiId = nil
+                    poiEditor(nil, worldX, worldZ)
+                    handled = true
+                end
+            end
             if not handled then inspectMapPoint(mouseX, mouseY) end
             if not handled and display
                 and mouseY >= display.mapTop
                 and mouseY < display.mapTop + display.mapHeight then
+                selectedPoiId = nil
                 if button == 1 then
                     local worldX = display.mapViewX
                         + (mouseX - display.centerX)

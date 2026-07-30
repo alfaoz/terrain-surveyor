@@ -2,6 +2,7 @@ local LIBRARY = fs.exists("/atlas/lib.lua") and "/atlas/lib.lua" or "atlas/lib.l
 local atlas = dofile(LIBRARY)
 
 local CONFIG_PATH = "/atlas/station.cfg"
+local POI_PATH = "/atlas/pois.dat"
 local LOG_LIMIT = 80
 local DRIVE_RESCAN_SECONDS = 1
 local UI_REFRESH_SECONDS = 0.10
@@ -45,6 +46,10 @@ local catalogKeys
 local catalogDirty = true
 local catalogBuiltAt = 0
 local dirtyVolumeIndexes = {}
+local poiStore = atlas.readTable(POI_PATH) or {}
+poiStore.format = 1
+poiStore.revision = tonumber(poiStore.revision) or 0
+poiStore.pois = type(poiStore.pois) == "table" and poiStore.pois or {}
 local stats = {
     uploads = 0,
     downloads = 0,
@@ -633,6 +638,88 @@ local function totalCapacity()
     return known and capacity or nil, free
 end
 
+local function poiList()
+    local result = {}
+    for _, poi in pairs(poiStore.pois) do
+        result[#result + 1] = poi
+    end
+    table.sort(result, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return result
+end
+
+local function validCoordinate(value)
+    return type(value) == "number"
+        and value == value
+        and math.abs(value) <= 30000000
+end
+
+local function cleanPoiText(value, maximum, fallback)
+    local text = tostring(value or fallback or "")
+        :gsub("[%c]", " ")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+    if text == "" then text = fallback or "" end
+    return text:sub(1, maximum)
+end
+
+local function savePoiStore()
+    return atlas.writeTable(POI_PATH, poiStore)
+end
+
+local function storePoi(sender, value)
+    if type(value) ~= "table"
+        or type(value.dimension) ~= "string"
+        or value.dimension == ""
+        or not validCoordinate(value.x)
+        or not validCoordinate(value.z)
+        or value.y ~= nil and not validCoordinate(value.y) then
+        return nil, "invalid POI"
+    end
+    local existing = type(value.id) == "string" and poiStore.pois[value.id]
+    local id = existing and existing.id or atlas.randomId("poi")
+    local timestamp = atlas.now()
+    local poi = {
+        id = id,
+        name = cleanPoiText(value.name, 32, "POINT"),
+        category = cleanPoiText(value.category, 16, "GENERAL"):upper(),
+        dimension = value.dimension,
+        x = math.floor(value.x + 0.5),
+        y = value.y and math.floor(value.y + 0.5) or nil,
+        z = math.floor(value.z + 0.5),
+        createdAt = existing and existing.createdAt or timestamp,
+        updatedAt = timestamp,
+        createdBy = existing and existing.createdBy or sender
+    }
+    poiStore.pois[id] = poi
+    poiStore.revision = poiStore.revision + 1
+    local ok, failure = savePoiStore()
+    if not ok then
+        if existing then poiStore.pois[id] = existing
+        else poiStore.pois[id] = nil end
+        poiStore.revision = poiStore.revision - 1
+        return nil, failure
+    end
+    return poi
+end
+
+local function deletePoi(identifier)
+    if type(identifier) ~= "string" or not poiStore.pois[identifier] then
+        return false, "POI not found"
+    end
+    local previous = poiStore.pois[identifier]
+    poiStore.pois[identifier] = nil
+    poiStore.revision = poiStore.revision + 1
+    local ok, failure = savePoiStore()
+    if not ok then
+        poiStore.pois[identifier] = previous
+        poiStore.revision = poiStore.revision - 1
+        return false, failure
+    end
+    return true
+end
+
 local function stationInfo()
     local capacity, free = totalCapacity()
     return {
@@ -645,6 +732,7 @@ local function stationInfo()
         capacity = capacity,
         free = free,
         aircraft = tableCount(aircraft),
+        pois = tableCount(poiStore.pois),
         capabilities = {
             bulkTiles = true,
             maxBulkTiles = MAX_BULK_REQUEST_TILES,
@@ -656,7 +744,9 @@ local function stationInfo()
             windowSegmentsInFlight = WINDOW_SEGMENT_CONCURRENCY,
             catalog = true,
             catalogPageSize = CATALOG_PAGE_SIZE,
-            catalogRevision = catalogRevision
+            catalogRevision = catalogRevision,
+            sharedPois = true,
+            poiRevision = poiStore.revision
         }
     }
 end
@@ -937,6 +1027,57 @@ local function handleMessage(sender, message)
     elseif message.op == "get_catalog" then
         atlas.reply(sender, message, "catalog_page",
             catalogPage(message.cursor, message.limit))
+    elseif message.op == "get_pois" then
+        if tonumber(message.revision) == poiStore.revision then
+            atlas.reply(sender, message, "pois_current", {
+                revision = poiStore.revision
+            })
+        else
+            atlas.reply(sender, message, "pois_data", {
+                revision = poiStore.revision,
+                pois = poiList()
+            })
+        end
+    elseif message.op == "put_poi" then
+        if not authorised(message) then
+            atlas.reply(sender, message, "poi_error", {
+                reason = "write access denied"
+            })
+        else
+            local poi, failure = storePoi(sender, message.poi)
+            if poi then
+                log(("POI saved: %s (%d,%d) by %d"):format(
+                    poi.name, poi.x, poi.z, sender))
+                atlas.reply(sender, message, "poi_stored", {
+                    poi = poi,
+                    revision = poiStore.revision
+                })
+            else
+                atlas.reply(sender, message, "poi_error", {
+                    reason = failure
+                })
+            end
+        end
+    elseif message.op == "delete_poi" then
+        if not authorised(message) then
+            atlas.reply(sender, message, "poi_error", {
+                reason = "write access denied"
+            })
+        else
+            local ok, failure = deletePoi(message.poiId)
+            if ok then
+                log(("POI deleted: %s by %d"):format(
+                    tostring(message.poiId), sender))
+                atlas.reply(sender, message, "poi_deleted", {
+                    poiId = message.poiId,
+                    revision = poiStore.revision
+                })
+            else
+                atlas.reply(sender, message, "poi_error", {
+                    reason = failure
+                })
+            end
+        end
     elseif message.op == "heartbeat" then
         aircraft[sender] = {
             callsign = message.callsign or ("AC-" .. sender),
@@ -1033,7 +1174,8 @@ local function drawOverview(width, height)
     writeAt(2, 4, config.name, colors.lightBlue)
     writeAt(2, 5, ("TILES       %d"):format(tableCount(tileIndex)), colors.white)
     writeAt(2, 6, ("VOLUMES     %d"):format(tableCount(volumes)), colors.white)
-    writeAt(2, 7, ("AIRCRAFT    %d"):format(tableCount(aircraft)), colors.white)
+    writeAt(2, 7, ("AIRCRAFT    %d  POIS %d"):format(
+        tableCount(aircraft), tableCount(poiStore.pois)), colors.white)
     writeAt(2, 8, fit("LINK        " .. radioDetail, width - 3),
         radioState == "WIRELESS" and colors.lime
             or radioState == "WIRED" and colors.yellow or colors.red)

@@ -1,7 +1,7 @@
 local atlas = {}
 
 atlas.VERSION = 1
-atlas.APP_VERSION = "1.3.0"
+atlas.APP_VERSION = "1.4.0"
 atlas.PROTOCOL_DISCOVERY = "atlas.discovery.v1"
 atlas.PROTOCOL_LINK = "atlas.link.v1"
 atlas.VOLUME_FORMAT = 1

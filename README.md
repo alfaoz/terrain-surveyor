@@ -160,10 +160,12 @@ but still includes collidable transparent obstacles.
 The `atlas/` directory contains the first complete ATLAS application:
 
 - `lib.lua`: shared protocol, terrain-file, capacity, and peripheral helpers.
-- `station.lua`: the home map station, storage-rack controller, and traffic
-  service. Its interface runs entirely on the station computer.
+- `station.lua`: the home map station, storage-rack controller, traffic
+  service, and persistent shared POI database. Its interface runs entirely on
+  the station computer.
 - `navigator.lua`: the onboard CC: Graphics navigator, persistent cache,
-  waypoints, smart survey scheduler, network prefetch, and live traffic.
+  local route waypoints, shared POIs, smart survey scheduler, network prefetch,
+  and live traffic.
 
 ATLAS volumes are ordinary floppy disks attached through any number of wired
 disk drives. The station detects their real capacity with `fs.getCapacity` and
@@ -187,7 +189,6 @@ On the home station computer:
 
 ```text
 allay install atlas-station
-atlas-station
 ```
 
 Fresh empty floppies appear as `UNFORMATTED`. Open Storage, enter maintenance,
@@ -198,8 +199,14 @@ On each aircraft computer:
 
 ```text
 allay install atlas-navigator
-atlas-navigator
 ```
+
+Both Allay packages install their own managed startup launcher. Reboot the
+computer to start the selected ATLAS role automatically, or run
+`atlas-station`/`atlas-navigator` once to start it immediately. Keep the actual
+programs in `/bin` and `/atlas`; Allay updates those files in place. The
+launchers show a short centered ATLAS boot sequence and adapt to the available
+terminal size, including a 74 by 31 computer terminal.
 
 An empty data disk in any attached onboard disk drive is automatically
 initialized as an `ATLAS AIR CACHE`. The computer filesystem and every attached
@@ -236,6 +243,12 @@ Controls:
 - Right-click a waypoint marker: delete that waypoint
 - `X` or the `DEL` button: delete the active waypoint
 - `N`: advance to the next waypoint
+- Middle-click the map: create a shared POI at that location
+- Click a POI marker: select it and show its saved details
+- `P` or `POI`: create a POI, or edit the selected POI
+- `GO`: append the selected POI to the aircraft's active route
+- `E`: edit the selected POI
+- `K` or `PDEL`: delete the selected POI after confirmation
 - `H`: calibrate CC:Sable heading to the current straight-line ground track
 - `R`: rescan the current chunk
 - `Q`: close and return to text mode
@@ -247,6 +260,14 @@ visible tile checksums against the station, downloads shared tiles contributed
 by other aircraft, and only surveys after the station explicitly reports that a
 tile is missing. Known tiles are never automatically rescanned; `R` is the
 explicit resurvey command.
+
+Shared POIs have a name, category, dimension, X/Z position, and optional
+altitude. The selected station is the source of truth and stores them
+atomically in `/atlas/pois.dat`. Every connected navigator checks the list
+about once per second and saves an onboard copy, so POIs remain visible if the
+link drops. Creating, editing, and deleting POIs uses the station write key
+when one is configured. Route waypoints remain private to an aircraft and are
+not mixed into the shared POI database.
 
 The navigator polls position and redraws at the Minecraft tick rate. At speed,
 the native surveyor scans up to 16 station-confirmed missing chunks per poll

@@ -156,6 +156,8 @@ tasks.register('verifyCraftOsLua', JavaExec) {
             file('atlas/lib.lua'),
             file('atlas/station.lua'),
             file('atlas/navigator.lua'),
+            file('atlas/startup-navigator.lua'),
+            file('atlas/startup-station.lua'),
             file('examples/surveyor_test.lua'),
             file('examples/terrain_map.lua'),
             file('examples/atlas_bandwidth_test.lua')
