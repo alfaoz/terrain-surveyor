@@ -10,6 +10,8 @@ local atlas = dofile(LIBRARY)
 -- Keep helpers in a private program environment instead of consuming one
 -- Cobalt local slot each. CraftOS permits at most 200 active locals.
 local _ENV = setmetatable({}, { __index = _ENV })
+COMPANION_HOST_LIBRARY = fs.exists("/atlas/companion-host.lua")
+    and "/atlas/companion-host.lua" or "atlas/companion-host.lua"
 
 -- One Minecraft tick: 20 visual/position updates per second.
 local UPDATE_SECONDS = 0.05
@@ -308,6 +310,7 @@ local routeData = atlas.readTable(ROUTE_PATH) or {}
 local waypoints = type(routeData.waypoints) == "table"
     and routeData.waypoints or {}
 local activeWaypoint = math.max(1, tonumber(routeData.active) or 1)
+routeRevision = math.max(0, tonumber(routeData.revision) or 0)
 
 local poiCache = atlas.readTable(POI_CACHE_PATH) or {}
 local pois = {}
@@ -383,6 +386,8 @@ local scanPlanSignature
 local modal = false
 local lastDisplayMap
 local pointerDetails
+pairDialog = nil
+companionHost = nil
 local viewportPrefetchState
 local catalogState = {
     revision = nil,
@@ -405,13 +410,149 @@ local scanMetrics = {
     batchSupported = false
 }
 
-function saveRoute()
+function saveRoute(changed)
+    if changed then routeRevision = routeRevision + 1 end
     activeWaypoint = math.max(1, math.min(
         activeWaypoint, math.max(1, #waypoints)))
     atlas.writeTable(ROUTE_PATH, {
+        format = 1,
+        revision = routeRevision,
         waypoints = waypoints,
         active = activeWaypoint
     })
+end
+
+function routeSnapshot()
+    local snapshot = {}
+    for index, waypoint in ipairs(waypoints) do
+        snapshot[index] = {
+            name = waypoint.name,
+            x = waypoint.x,
+            y = waypoint.y,
+            z = waypoint.z
+        }
+    end
+    return {
+        revision = routeRevision,
+        waypoints = snapshot,
+        active = activeWaypoint
+    }
+end
+
+function trafficArray()
+    local result = {}
+    for _, contact in pairs(traffic) do
+        result[#result + 1] = contact
+    end
+    return result
+end
+
+function companionSnapshot()
+    return {
+        aircraft = info and {
+            dimension = info.dimension,
+            x = info.x,
+            y = info.y,
+            z = info.z,
+            chunkX = info.chunkX,
+            chunkZ = info.chunkZ,
+            heading = motion.heading,
+            track = motion.track,
+            speed = motion.speed
+        } or nil,
+        route = routeSnapshot(),
+        pois = poiArray(),
+        poiRevision = poiRevision,
+        traffic = trafficArray(),
+        station = {
+            id = serverId,
+            name = serverInfo and serverInfo.name,
+            status = linkStatus
+        },
+        scan = {
+            status = scanStatus,
+            chunksPerSecond = scanMetrics.chunksPerSecond,
+            aheadSeconds = scanMetrics.aheadSeconds
+        }
+    }
+end
+
+function companionGetTile(dimension, chunkX, chunkZ)
+    local key = tileKey(dimension, chunkX, chunkZ)
+    local loaded = tiles[key]
+    if loaded and loaded.raw then return atlas.copyTile(loaded.raw), "data" end
+    local pendingWrite = cacheWriteQueue[key]
+    if pendingWrite and pendingWrite.raw then
+        return atlas.copyTile(pendingWrite.raw), "data"
+    end
+    local raw = loadLocalRaw(dimension, chunkX, chunkZ)
+    if raw then return raw, "data" end
+    if nowMs() < (networkMissUntil[key] or 0) then
+        return nil, "missing"
+    end
+    if serverId and linkStatus ~= "LOST" then
+        queueDownload(dimension, chunkX, chunkZ, -25000, false, true)
+        return nil, "pending"
+    end
+    return nil, "unavailable"
+end
+
+function companionMutateRoute(operation, message)
+    local baseRevision = tonumber(message.baseRevision)
+    if baseRevision and baseRevision ~= routeRevision then
+        return false, "route changed; refresh and try again", routeSnapshot()
+    end
+    if operation == "route_add" then
+        local waypoint = type(message.waypoint) == "table"
+            and message.waypoint or {}
+        local x = tonumber(waypoint.x)
+        local z = tonumber(waypoint.z)
+        local y = waypoint.y ~= nil and tonumber(waypoint.y) or nil
+        if not x or not z or math.abs(x) > 30000000
+            or math.abs(z) > 30000000
+            or waypoint.y ~= nil and not y then
+            return false, "invalid waypoint", routeSnapshot()
+        end
+        local name = tostring(waypoint.name or ("WP" .. (#waypoints + 1)))
+        name = name:gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 24)
+        if name == "" then name = "WP" .. (#waypoints + 1) end
+        addWaypoint(x, z, y, name)
+    elseif operation == "route_delete" then
+        local index = math.floor(tonumber(message.index) or activeWaypoint)
+        if not removeWaypoint(index) then
+            return false, "waypoint does not exist", routeSnapshot()
+        end
+    elseif operation == "route_set_active" then
+        local index = math.floor(tonumber(message.index) or 0)
+        if not waypoints[index] then
+            return false, "waypoint does not exist", routeSnapshot()
+        end
+        activeWaypoint = index
+        scanPlanSignature = nil
+        saveRoute(true)
+    else
+        return false, "unsupported route operation", routeSnapshot()
+    end
+    return true, nil, routeSnapshot()
+end
+
+function startCompanionHost()
+    if not fs.exists(COMPANION_HOST_LIBRARY) then
+        scanStatus = "COMPANION HOST NOT INSTALLED"
+        return false
+    end
+    local module = dofile(COMPANION_HOST_LIBRARY)
+    companionHost = module.new({
+        callsign = function() return navConfig.callsign end,
+        snapshot = companionSnapshot,
+        getTile = companionGetTile,
+        mutateRoute = companionMutateRoute
+    })
+    if not companionHost:host() then
+        scanStatus = "COMPANION HOST OFFLINE"
+        return false
+    end
+    return true
 end
 
 function nextWaypoint()
@@ -1641,6 +1782,69 @@ function drawToolbarButton(
     return x + buttonWidth + 2
 end
 
+function drawCompanionPairDialog(width, height)
+    if not pairDialog or not companionHost then return end
+    local pairing = companionHost:pairingStatus()
+    if not pairing then
+        pairDialog = nil
+        scanStatus = "COMPANION PAIRED OR CODE EXPIRED"
+        return
+    end
+
+    local dialogWidth = math.min(236, width - 20)
+    local dialogHeight = 82
+    local left = math.floor((width - dialogWidth) / 2)
+    local top = math.floor((height - dialogHeight) / 2)
+    term.drawPixels(left, top, COLOR.panelEdge, dialogWidth, dialogHeight)
+    term.drawPixels(
+        left + 2, top + 2, COLOR.panel,
+        dialogWidth - 4, dialogHeight - 4)
+    drawText(left + 10, top + 9, "PAIR ATLAS COMPANION",
+        COLOR.text, width, height)
+    drawText(left + 10, top + 24, "ENTER THIS CODE ON THE POCKET",
+        COLOR.textDim, width, height)
+    drawText(left + 72, top + 39, pairing.code,
+        COLOR.route, width, height)
+    local seconds = math.max(0,
+        math.ceil((pairing.expiresAt - nowMs()) / 1000))
+    drawText(left + 10, top + 55,
+        ("EXPIRES IN %dS"):format(seconds),
+        COLOR.textDim, width, height)
+    local cancelWidth = 54
+    local cancelLeft = left + dialogWidth - cancelWidth - 10
+    local cancelTop = top + dialogHeight - 17
+    term.drawPixels(
+        cancelLeft, cancelTop, COLOR.warning, cancelWidth, 9)
+    drawText(cancelLeft + 7, cancelTop + 2, "CANCEL",
+        COLOR.background, width, height)
+    pairDialog.cancel = {
+        x1 = cancelLeft,
+        x2 = cancelLeft + cancelWidth - 1,
+        y1 = cancelTop,
+        y2 = cancelTop + 8
+    }
+end
+
+function handleCompanionPairEvent(event)
+    if not pairDialog then return false end
+    if event[1] == "key" and event[2] == keys.escape then
+        companionHost:cancelPairing()
+        pairDialog = nil
+        scanStatus = "PAIRING CANCELLED"
+    elseif event[1] == "mouse_click" and pairDialog.cancel then
+        local x = event[3]
+        local y = event[4]
+        local bounds = pairDialog.cancel
+        if x >= bounds.x1 and x <= bounds.x2
+            and y >= bounds.y1 and y <= bounds.y2 then
+            companionHost:cancelPairing()
+            pairDialog = nil
+            scanStatus = "PAIRING CANCELLED"
+        end
+    end
+    return true
+end
+
 function drawAircraft(
         screenX, screenY, heading, width, height, warning)
     local edge = COLOR.aircraftEdge
@@ -1950,8 +2154,9 @@ function render()
     local networkLabel = serverId
         and ((serverInfo and serverInfo.name) or ("SERVER " .. serverId))
         or "OFFLINE"
-    local header = ("ATLAS NAV %s LINK:%s %s"):format(
-        navConfig.callsign, linkStatus, networkLabel)
+    local mobileCount = companionHost and companionHost:sessionCount() or 0
+    local header = ("ATLAS NAV %s LINK:%s MOB:%d %s"):format(
+        navConfig.callsign, linkStatus, mobileCount, networkLabel)
     drawText(2, 2, fitText(header, width), COLOR.text, width, height)
     local waypoint = nextWaypoint()
     local bearing = waypoint and bearingBetween(
@@ -2020,6 +2225,8 @@ function render()
         toolbarButtons, toolbarX, toolbarY, "CTR", "center", width, height)
     toolbarX = drawToolbarButton(
         toolbarButtons, toolbarX, toolbarY, "HOME", "home", width, height)
+    toolbarX = drawToolbarButton(
+        toolbarButtons, toolbarX, toolbarY, "PAIR", "pair", width, height)
     drawText(toolbarX + 2, footerY + 14,
         fitText("LCLICK WP  MCLICK POI  CLICK POI SELECT",
             width - toolbarX - 2),
@@ -2044,6 +2251,7 @@ function render()
         width, height, terrainWarning)
     drawPoiContextMenu(width, height)
     drawPoiDialog(width, height)
+    drawCompanionPairDialog(width, height)
     term.setFrozen(false)
 end
 
@@ -2109,7 +2317,7 @@ function refreshInfo()
         if activeWaypoint < #waypoints then
             activeWaypoint = activeWaypoint + 1
             scanPlanSignature = nil
-            saveRoute()
+            saveRoute(true)
         end
     end
 
@@ -3022,8 +3230,20 @@ function networkLoop()
         elseif event[1] == "rednet_message"
             and event[4] == atlas.PROTOCOL_LINK then
             handleNetworkMessage(event[2], event[3])
+        elseif event[1] == "rednet_message"
+            and event[4] == atlas.PROTOCOL_COMPANION_LINK
+            and companionHost then
+            local handled, failure = pcall(
+                companionHost.handle,
+                companionHost,
+                event[2],
+                event[3])
+            if not handled then
+                scanStatus = "COMPANION LINK ERROR"
+            end
         elseif event[1] == "timer" and event[2] == timer then
             local currentTime = nowMs()
+            if companionHost then companionHost:tick() end
             expireNetworkRequests()
             processCatalogMirror()
             processNetworkQueue()
@@ -3164,7 +3384,7 @@ function addWaypoint(worldX, worldZ, altitude, name)
     }
     if #waypoints == 1 then activeWaypoint = 1 end
     scanPlanSignature = nil
-    saveRoute()
+    saveRoute(true)
     pointerDetails = nil
     scanStatus = "ADDED " .. tostring(
         waypoints[#waypoints].name or ("WP" .. #waypoints))
@@ -3181,7 +3401,7 @@ function removeWaypoint(index)
         activeWaypoint = math.min(activeWaypoint, #waypoints)
     end
     scanPlanSignature = nil
-    saveRoute()
+    saveRoute(true)
     scanStatus = "REMOVED " .. tostring(removed.name or ("WP" .. index))
     return true
 end
@@ -3717,7 +3937,7 @@ function performNavAction(action)
         if activeWaypoint < #waypoints then
             activeWaypoint = activeWaypoint + 1
             scanPlanSignature = nil
-            saveRoute()
+            saveRoute(true)
         end
     elseif action == "delete" then
         removeWaypoint(activeWaypoint)
@@ -3725,6 +3945,14 @@ function performNavAction(action)
         returnHomeView()
     elseif action == "home" then
         openHomeMenu()
+    elseif action == "pair" then
+        if not companionHost then
+            scanStatus = "COMPANION NEEDS A WIRELESS MODEM"
+        else
+            companionHost:openPairing(120000)
+            pairDialog = {}
+            scanStatus = "COMPANION PAIRING OPEN"
+        end
     end
 end
 
@@ -3736,6 +3964,8 @@ function inputLoop()
         if eventName == "terminate" then
             running = false
             return
+        elseif pairDialog then
+            handleCompanionPairEvent(event)
         elseif poiDialog then
             handlePoiDialogEvent(event)
         elseif eventName == "char" then
@@ -3894,6 +4124,7 @@ function main()
     else
         linkStatus = "OFFLINE"
     end
+    if #wireless > 0 then startCompanionHost() end
 
     if not term.setGraphicsMode or not term.drawPixels or not term.setFrozen then
         error("CC: Graphics is not available on this computer", 0)
@@ -3917,6 +4148,7 @@ function main()
 end
 
 local ok, failure = xpcall(main, debug.traceback)
+if companionHost then pcall(companionHost.close, companionHost) end
 pcall(term.setFrozen, false)
 pcall(term.setGraphicsMode, false)
 restoreTextPalette()

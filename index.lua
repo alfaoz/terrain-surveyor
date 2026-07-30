@@ -7,7 +7,7 @@ return {
 
     packages = {
         ["atlas-core"] = {
-            version = "1.2.0",
+            version = "1.3.0",
             description = "Shared ATLAS protocol and terrain storage library",
             file = "allay/atlas-core.lua"
         },
@@ -17,9 +17,14 @@ return {
             file = "allay/atlas-station.lua"
         },
         ["atlas-navigator"] = {
-            version = "1.4.3",
-            description = "Shared CC:Graphics terrain, POI, and waypoint navigator",
+            version = "1.5.0",
+            description = "Shared CC:Graphics terrain, companion, POI, and waypoint navigator",
             file = "allay/atlas-navigator.lua"
+        },
+        ["atlas-companion"] = {
+            version = "1.0.0",
+            description = "Paired pocket moving map and live aircraft route controller",
+            file = "allay/atlas-companion.lua"
         }
     }
 }

@@ -1,9 +1,11 @@
 local atlas = {}
 
 atlas.VERSION = 1
-atlas.APP_VERSION = "1.4.0"
+atlas.APP_VERSION = "1.5.0"
 atlas.PROTOCOL_DISCOVERY = "atlas.discovery.v1"
 atlas.PROTOCOL_LINK = "atlas.link.v1"
+atlas.PROTOCOL_COMPANION_DISCOVERY = "atlas.companion.discovery.v1"
+atlas.PROTOCOL_COMPANION_LINK = "atlas.companion.link.v1"
 atlas.VOLUME_FORMAT = 1
 atlas.VOLUME_META = "atlas/volume.dat"
 atlas.VOLUME_INDEX = "atlas/index.dat"
@@ -283,6 +285,19 @@ function atlas.reply(recipient, request, operation, payload)
     payload = payload or {}
     payload.requestId = request and request.requestId or payload.requestId
     return atlas.send(recipient, operation, payload)
+end
+
+function atlas.sendProtocol(recipient, protocol, operation, payload)
+    payload = payload or {}
+    payload.atlas = atlas.VERSION
+    payload.op = operation
+    return rednet.send(recipient, payload, protocol)
+end
+
+function atlas.replyProtocol(recipient, protocol, request, operation, payload)
+    payload = payload or {}
+    payload.requestId = request and request.requestId or payload.requestId
+    return atlas.sendProtocol(recipient, protocol, operation, payload)
 end
 
 return atlas

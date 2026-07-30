@@ -166,6 +166,9 @@ The `atlas/` directory contains the first complete ATLAS application:
 - `navigator.lua`: the onboard CC: Graphics navigator, persistent cache,
   local route waypoints, shared POIs, smart survey scheduler, network prefetch,
   and live traffic.
+- `companion.lua`: the Ender Pocket Computer moving map. It pairs directly
+  with one aircraft navigator and can view terrain, telemetry, traffic, shared
+  POIs, and edit that aircraft's live route without owning a surveyor.
 
 ATLAS volumes are ordinary floppy disks attached through any number of wired
 disk drives. The station detects their real capacity with `fs.getCapacity` and
@@ -201,12 +204,19 @@ On each aircraft computer:
 allay install atlas-navigator
 ```
 
-Both Allay packages install their own managed startup launcher. Reboot the
+On an Ender Pocket Computer:
+
+```text
+allay install atlas-companion
+```
+
+All three role packages install their own managed startup launcher. Reboot the
 computer to start the selected ATLAS role automatically, or run
-`atlas-station`/`atlas-navigator` once to start it immediately. Keep the actual
-programs in `/bin` and `/atlas`; Allay updates those files in place. The
-launchers show a short centered ATLAS boot sequence and adapt to the available
-terminal size, including a 74 by 31 computer terminal.
+`atlas-station`, `atlas-navigator`, or `atlas-companion` once to start it
+immediately. Keep the actual programs in `/bin` and `/atlas`; Allay updates
+those files in place. The launchers show a short centered ATLAS boot sequence
+and adapt to the available terminal size, including a 74 by 31 computer
+terminal.
 
 An empty data disk in any attached onboard disk drive is automatically
 initialized as an `ATLAS AIR CACHE`. The computer filesystem and every attached
@@ -217,9 +227,9 @@ When storage pressure requires replacement, synchronized distant tiles are
 evicted first. Newly surveyed data is pinned until the station confirms that
 it has stored the same checksum.
 
-`atlas-station` and `atlas-navigator` both depend on `atlas-core`, which Allay
-installs and updates automatically. The package manifests pin SHA-256 hashes
-for every downloaded Lua file.
+Every role package depends on `atlas-core`, which Allay installs and updates
+automatically. The package manifests pin SHA-256 hashes for every downloaded
+Lua file.
 
 ## Legacy launcher
 
@@ -234,6 +244,7 @@ Controls:
 - Arrow keys: pan and leave follow mode
 - Space, Escape, `B`, or the `CTR` button: recenter and resume follow mode
 - `HOME`: return to the network menu without closing the navigator
+- `PAIR`: display a six-digit, two-minute companion onboarding code
 - On startup, the navigator automatically reconnects to the remembered station;
   if it is unavailable, the network menu opens instead
 - `C` on the Home screen: change the vehicle code (`XX-NN`, such as `AC-01`)
@@ -271,6 +282,41 @@ about once per second and saves an onboard copy, so POIs remain visible if the
 link drops. Creating, editing, and deleting POIs uses the station write key
 when one is configured. Route waypoints remain private to an aircraft and are
 not mixed into the shared POI database.
+
+### ATLAS Companion
+
+Pairing is deliberately initiated in the cockpit. On the aircraft navigator,
+press `PAIR`; on the Ender Pocket Computer, start `atlas-companion`, select the
+aircraft, and enter the displayed code. The pocket saves a device identifier
+and secret in `/atlas/companion.cfg`, while the navigator saves approved
+devices in `/atlas/companions.dat`. Both survive reboot and chunk unload. Later
+starts reconnect to the last aircraft automatically.
+
+The companion talks to the aircraft, not directly to the station. The aircraft
+remains the only Terrain Surveyor client and serves tiles from its live map,
+onboard cache, or shared station connection. Consequently, a pocket cannot
+force scans in unloaded chunks. It does keep every received tile in
+`/atlas/companion-cache`, so previously viewed terrain remains available during
+a brief link loss.
+
+Companion controls:
+
+- Left-click the map: append a waypoint to the aircraft's route
+- Right-click a waypoint: remove it from the aircraft's route
+- `W` or `ADD`: enter an exact named waypoint with optional altitude
+- Click a POI, then `GO`: append that shared POI to the route
+- `NEXT`: advance the active waypoint
+- `DEL`: remove the active waypoint
+- Arrow keys: pan; Space, Escape, or `CTR`: follow the aircraft again
+- Mouse wheel or `+` / `-`: zoom
+- `LINK` or `L`: return to aircraft selection without restarting
+- `Q`: close safely and restore text mode
+
+Route changes use a revision number. If the cockpit and pocket edit at the
+same moment, a stale change is rejected and the pocket receives the newest
+route instead of overwriting it. The aircraft pushes position, heading,
+ground track, speed, route, POIs, and traffic to active companions five times
+per second. Terrain transfers retain ATLAS's tested 14-tile batches.
 
 The POI editor and deletion confirmation are graphical overlays, so the
 navigator never leaves the live map while managing a POI. On the station,
