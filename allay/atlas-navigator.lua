@@ -1,6 +1,6 @@
 return {
     name = "atlas-navigator",
-    version = "1.4.0",
+    version = "1.4.1",
     description = "Shared ATLAS terrain, POI, cache, and waypoint navigator",
     author = "alfaoz",
 
@@ -17,7 +17,7 @@ return {
 
     hashes = {
         ["navigator.lua"] = "60f4a0423b4671800efaee16890fa868d1d74a17e8e17bc4ff5b143ac689d76a",
-        ["startup-navigator.lua"] = "cccc60edf8a1b7405b7cb3fa21b3dfd281d34a0c18518e98b7bf821756e86a92"
+        ["startup-navigator.lua"] = "0f2e47de97f4a9e2f68cbfc3154249932641adc2630fc0dbbaf98b95c3876295"
     },
 
     dependencies = { "atlas-core" },
