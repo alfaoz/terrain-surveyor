@@ -247,6 +247,7 @@ Controls:
 - `N`: advance to the next waypoint
 - Middle-click the map: create a shared POI at that location
 - Click a POI marker: select it and show its saved details
+- Right-click a POI marker: open its in-map `EDIT` / `DELETE` menu
 - `P` or `POI`: create a POI, or edit the selected POI
 - `GO`: append the selected POI to the aircraft's active route
 - `E`: edit the selected POI
@@ -270,6 +271,12 @@ about once per second and saves an onboard copy, so POIs remain visible if the
 link drops. Creating, editing, and deleting POIs uses the station write key
 when one is configured. Route waypoints remain private to an aircraft and are
 not mixed into the shared POI database.
+
+The POI editor and deletion confirmation are graphical overlays, so the
+navigator never leaves the live map while managing a POI. On the station,
+open page `4 POIS` to browse the server-owned list. Select a POI and press
+`DELETE` (or `D`); the station requires `CONFIRM DELETE` before permanently
+removing it for every aircraft.
 
 The navigator polls position and redraws at the Minecraft tick rate. At speed,
 the native surveyor scans up to 16 station-confirmed missing chunks per poll

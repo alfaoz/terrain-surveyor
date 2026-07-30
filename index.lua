@@ -12,12 +12,12 @@ return {
             file = "allay/atlas-core.lua"
         },
         ["atlas-station"] = {
-            version = "1.4.1",
+            version = "1.4.2",
             description = "Shared terrain and POI database, disk rack, and traffic server",
             file = "allay/atlas-station.lua"
         },
         ["atlas-navigator"] = {
-            version = "1.4.2",
+            version = "1.4.3",
             description = "Shared CC:Graphics terrain, POI, and waypoint navigator",
             file = "allay/atlas-navigator.lua"
         }

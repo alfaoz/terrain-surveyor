@@ -320,6 +320,8 @@ end
 local poiRevision = tonumber(poiCache.revision) or 0
 local poiSourceId = tonumber(poiCache.serverId)
 local selectedPoiId
+local poiDialog
+local poiMenu
 
 local cacheIndex = atlas.readTable(CACHE_META_PATH) or {}
 cacheIndex.tiles = type(cacheIndex.tiles) == "table" and cacheIndex.tiles or {}
@@ -2040,6 +2042,8 @@ function render()
     local terrainWarning = clearance and info.y <= clearance + 5
     drawAircraft(aircraftX, aircraftY, motion.heading,
         width, height, terrainWarning)
+    drawPoiContextMenu(width, height)
+    drawPoiDialog(width, height)
     term.setFrozen(false)
 end
 
@@ -3238,27 +3242,6 @@ function selectPoi(identifier)
     return poi
 end
 
-function enterTextModal(title)
-    modal = true
-    pcall(term.setFrozen, false)
-    pcall(term.setGraphicsMode, false)
-    restoreTextPalette()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-    term.setCursorPos(1, 1)
-    print(title)
-    print()
-end
-
-function leaveTextModal()
-    local ok, failure = pcall(term.setGraphicsMode, 2)
-    if not ok then error(failure, 0) end
-    configurePalette()
-    invalidateRenderStyle()
-    modal = false
-end
-
 function poiEditor(identifier, seedX, seedZ)
     if not serverId or linkStatus == "LOST" then
         scanStatus = "POI REQUIRES STATION LINK"
@@ -3285,60 +3268,91 @@ function poiEditor(identifier, seedX, seedZ)
         or ("POINT " .. (tableCount(pois) + 1))
     local defaultCategory = existing and existing.category or "GENERAL"
 
-    enterTextModal(existing and "ATLAS EDIT SHARED POI"
-        or "ATLAS NEW SHARED POI")
-    print("Saved on " .. tostring(
-        serverInfo and serverInfo.name or "the selected station") .. ".")
-    print("Type ! for the name to cancel.")
-    print()
-    write("Name [" .. defaultName .. "]: ")
-    local name = read()
-    if name == "!" then
-        leaveTextModal()
-        return
-    end
-    if name == "" then name = defaultName end
-    write("Category [" .. defaultCategory .. "]: ")
-    local category = read()
-    if category == "" then category = defaultCategory end
-    write(("X [%d]: "):format(math.floor(defaultX + 0.5)))
-    local xText = read()
-    write(("Z [%d]: "):format(math.floor(defaultZ + 0.5)))
-    local zText = read()
-    local defaultY = existing and existing.y
-    write(defaultY and ("Altitude [" .. defaultY .. "], - clears: ")
-        or "Altitude (optional): ")
-    local yText = read()
-
-    local x = xText == "" and defaultX or tonumber(xText)
-    local z = zText == "" and defaultZ or tonumber(zText)
-    local y = yText == "-" and nil
-        or yText == "" and defaultY
-        or tonumber(yText)
-    if x and z and (yText == "" or yText == "-" or y) then
-        local sent = sendPending("put_poi", {
-            poi = {
-                id = existing and existing.id or nil,
-                name = name,
-                category = category,
-                dimension = existing and existing.dimension
-                    or (info and info.dimension) or "minecraft:overworld",
-                x = x,
-                y = y,
-                z = z
+    poiMenu = nil
+    poiDialog = {
+        mode = "edit",
+        title = existing and "EDIT SHARED POI" or "NEW SHARED POI",
+        existingId = existing and existing.id or nil,
+        dimension = existing and existing.dimension
+            or (info and info.dimension) or "minecraft:overworld",
+        active = 1,
+        fields = {
+            {
+                key = "name", label = "NAME",
+                value = tostring(defaultName), maximum = 32
+            },
+            {
+                key = "category", label = "CATEGORY",
+                value = tostring(defaultCategory), maximum = 16
+            },
+            {
+                key = "x", label = "X",
+                value = tostring(math.floor(defaultX + 0.5)),
+                maximum = 12, numeric = true
+            },
+            {
+                key = "z", label = "Z",
+                value = tostring(math.floor(defaultZ + 0.5)),
+                maximum = 12, numeric = true
+            },
+            {
+                key = "y", label = "ALT",
+                value = existing and existing.y and tostring(existing.y) or "",
+                maximum = 12, numeric = true
             }
-        }, {
-            type = "poi_put"
-        })
-        scanStatus = sent and "SAVING SHARED POI" or "POI SEND FAILED"
-    else
-        scanStatus = "INVALID POI COORDINATES"
-    end
-    leaveTextModal()
+        }
+    }
 end
 
-function deleteSelectedPoi()
-    local poi = selectedPoiId and pois[selectedPoiId]
+function poiDialogValues()
+    local result = {}
+    for _, field in ipairs(poiDialog.fields or {}) do
+        result[field.key] = field.value
+    end
+    return result
+end
+
+function savePoiDialog()
+    if not poiDialog or poiDialog.mode ~= "edit" then return end
+    local values = poiDialogValues()
+    local x = tonumber(values.x)
+    local z = tonumber(values.z)
+    local y = values.y ~= "" and tonumber(values.y) or nil
+    if not x or not z or values.y ~= "" and not y then
+        poiDialog.error = "CHECK X Z AND ALTITUDE"
+        return
+    end
+    local name = values.name:gsub("^%s+", ""):gsub("%s+$", "")
+    local category = values.category:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then
+        poiDialog.error = "NAME CANNOT BE EMPTY"
+        return
+    end
+    if category == "" then category = "GENERAL" end
+    local sent = sendPending("put_poi", {
+        poi = {
+            id = poiDialog.existingId,
+            name = name,
+            category = category,
+            dimension = poiDialog.dimension,
+            x = x,
+            y = y,
+            z = z
+        }
+    }, {
+        type = "poi_put"
+    })
+    if sent then
+        scanStatus = "SAVING SHARED POI"
+        poiDialog = nil
+    else
+        poiDialog.error = "POI SEND FAILED"
+    end
+end
+
+function deleteSelectedPoi(identifier)
+    local poi = (identifier and pois[identifier])
+        or (selectedPoiId and pois[selectedPoiId])
     if not poi then
         scanStatus = "SELECT A POI FIRST"
         return
@@ -3347,22 +3361,251 @@ function deleteSelectedPoi()
         scanStatus = "POI REQUIRES STATION LINK"
         return
     end
-    enterTextModal("DELETE SHARED POI")
-    print(("%s [%s] at X:%d Z:%d"):format(
-        poi.name, poi.category or "GENERAL", poi.x, poi.z))
-    print()
-    write("Delete it for every aircraft? [y/N]: ")
-    local confirmed = read():lower() == "y"
-    if confirmed then
-        local sent = sendPending("delete_poi", {
-            poiId = poi.id
-        }, {
-            type = "poi_delete",
-            poiId = poi.id
-        })
-        scanStatus = sent and "DELETING SHARED POI" or "POI SEND FAILED"
+    poiMenu = nil
+    poiDialog = {
+        mode = "confirm_delete",
+        title = "DELETE SHARED POI",
+        poiId = poi.id,
+        poiName = poi.name,
+        x = poi.x,
+        z = poi.z
+    }
+end
+
+function confirmPoiDeletion()
+    if not poiDialog or poiDialog.mode ~= "confirm_delete" then return end
+    local identifier = poiDialog.poiId
+    local sent = sendPending("delete_poi", {
+        poiId = identifier
+    }, {
+        type = "poi_delete",
+        poiId = identifier
+    })
+    if sent then
+        scanStatus = "DELETING SHARED POI"
+        poiDialog = nil
+    else
+        poiDialog.error = "POI SEND FAILED"
     end
-    leaveTextModal()
+end
+
+function pointInside(x, y, bounds)
+    return bounds
+        and x >= bounds.x1 and x <= bounds.x2
+        and y >= bounds.y1 and y <= bounds.y2
+end
+
+function drawPoiContextMenu(width, height)
+    if not poiMenu or poiDialog then return end
+    local poi = pois[poiMenu.poiId]
+    if not poi then
+        poiMenu = nil
+        return
+    end
+    local menuWidth = 116
+    local menuHeight = 29
+    local x = clamp(poiMenu.anchorX, 2, width - menuWidth - 2)
+    local y = clamp(poiMenu.anchorY, 2, height - menuHeight - 2)
+    term.drawPixels(x, y, COLOR.panelEdge, menuWidth, menuHeight)
+    term.drawPixels(x + 1, y + 1, COLOR.panel,
+        menuWidth - 2, menuHeight - 2)
+    drawText(x + 5, y + 5,
+        fitText(poi.name or "POI", menuWidth - 10),
+        COLOR.poi, width, height)
+    local buttons = {}
+    local buttonX = x + 5
+    buttonX = drawToolbarButton(
+        buttons, buttonX, y + 17, "EDIT", "edit", width, height)
+    drawToolbarButton(
+        buttons, buttonX, y + 17, "DELETE", "delete", width, height)
+    poiMenu.bounds = {
+        x1 = x, y1 = y, x2 = x + menuWidth - 1,
+        y2 = y + menuHeight - 1
+    }
+    poiMenu.buttons = buttons
+end
+
+function drawPoiDialog(width, height)
+    if not poiDialog then return end
+    local editing = poiDialog.mode == "edit"
+    local panelWidth = math.min(300, width - 20)
+    local panelHeight = editing and 108 or 66
+    local panelX = math.floor((width - panelWidth) / 2)
+    local panelY = math.floor((height - panelHeight) / 2)
+    term.drawPixels(panelX, panelY,
+        COLOR.poi, panelWidth, panelHeight)
+    term.drawPixels(panelX + 2, panelY + 2,
+        COLOR.panel, panelWidth - 4, panelHeight - 4)
+    drawText(panelX + 8, panelY + 7,
+        poiDialog.title, COLOR.text, width, height)
+
+    poiDialog.panel = {
+        x1 = panelX, y1 = panelY,
+        x2 = panelX + panelWidth - 1,
+        y2 = panelY + panelHeight - 1
+    }
+    poiDialog.buttons = {}
+    if editing then
+        poiDialog.fieldBounds = {}
+        local boxX = panelX + 72
+        local boxWidth = panelWidth - 82
+        for index, field in ipairs(poiDialog.fields) do
+            local fieldY = panelY + 20 + (index - 1) * 14
+            drawText(panelX + 8, fieldY + 2,
+                field.label, COLOR.textDim, width, height)
+            local active = index == poiDialog.active
+            term.drawPixels(boxX, fieldY,
+                active and COLOR.poi or COLOR.panelEdge, boxWidth, 9)
+            term.drawPixels(boxX + 1, fieldY + 1,
+                COLOR.background, boxWidth - 2, 7)
+            local displayValue = field.value
+            if active and math.floor(nowMs() / 400) % 2 == 0 then
+                displayValue = displayValue .. "_"
+            end
+            drawText(boxX + 4, fieldY + 2,
+                fitText(displayValue, boxWidth - 6),
+                active and COLOR.text or COLOR.textDim, width, height)
+            poiDialog.fieldBounds[index] = {
+                x1 = boxX, y1 = fieldY,
+                x2 = boxX + boxWidth - 1, y2 = fieldY + 8
+            }
+        end
+        if poiDialog.error then
+            drawText(panelX + 8, panelY + 91,
+                fitText(poiDialog.error, panelWidth - 110),
+                COLOR.warning, width, height)
+        else
+            drawText(panelX + 8, panelY + 91,
+                "TAB FIELDS  ENTER NEXT  ESC CANCEL",
+                COLOR.textDim, width, height)
+        end
+        local buttonX = panelX + panelWidth - 93
+        buttonX = drawToolbarButton(
+            poiDialog.buttons, buttonX, panelY + 96,
+            "SAVE", "save", width, height)
+        drawToolbarButton(
+            poiDialog.buttons, buttonX, panelY + 96,
+            "CANCEL", "cancel", width, height)
+    else
+        drawText(panelX + 8, panelY + 22,
+            fitText("DELETE " .. tostring(poiDialog.poiName) .. "?",
+                panelWidth - 16),
+            COLOR.warning, width, height)
+        drawText(panelX + 8, panelY + 31,
+            fitText("THIS REMOVES IT FOR EVERY AIRCRAFT",
+                panelWidth - 16),
+            COLOR.textDim, width, height)
+        drawText(panelX + 8, panelY + 40,
+            ("X:%d Z:%d"):format(poiDialog.x, poiDialog.z),
+            COLOR.textDim, width, height)
+        if poiDialog.error then
+            drawText(panelX + 8, panelY + 46,
+                fitText(poiDialog.error, panelWidth - 110),
+                COLOR.warning, width, height)
+        end
+        local buttonX = panelX + panelWidth - 105
+        buttonX = drawToolbarButton(
+            poiDialog.buttons, buttonX, panelY + 53,
+            "CANCEL", "cancel", width, height)
+        drawToolbarButton(
+            poiDialog.buttons, buttonX, panelY + 53,
+            "DELETE", "confirm_delete", width, height)
+    end
+end
+
+function activatePoiDialogAction(action)
+    if action == "cancel" then
+        poiDialog = nil
+    elseif action == "save" then
+        savePoiDialog()
+    elseif action == "confirm_delete" then
+        confirmPoiDeletion()
+    end
+end
+
+function handlePoiDialogEvent(event)
+    if not poiDialog then return end
+    local eventName = event[1]
+    if eventName == "key" then
+        local key = event[2]
+        if key == keys.escape then
+            poiDialog = nil
+        elseif poiDialog.mode == "edit" then
+            if key == keys.backspace then
+                local field = poiDialog.fields[poiDialog.active]
+                field.value = field.value:sub(1, -2)
+                poiDialog.error = nil
+            elseif key == keys.tab or key == keys.down then
+                poiDialog.active = poiDialog.active % #poiDialog.fields + 1
+            elseif key == keys.up then
+                poiDialog.active = (poiDialog.active - 2)
+                    % #poiDialog.fields + 1
+            elseif key == keys.enter then
+                if poiDialog.active < #poiDialog.fields then
+                    poiDialog.active = poiDialog.active + 1
+                else
+                    savePoiDialog()
+                end
+            end
+        end
+    elseif eventName == "char" and poiDialog.mode == "edit" then
+        local field = poiDialog.fields[poiDialog.active]
+        local character = event[2]
+        if #field.value < field.maximum
+            and (not field.numeric or character:match("[%d%.%-]")) then
+            field.value = field.value .. character
+            poiDialog.error = nil
+        end
+    elseif eventName == "paste" and poiDialog.mode == "edit" then
+        local field = poiDialog.fields[poiDialog.active]
+        local addition = tostring(event[2]):gsub("[%c]", " ")
+        if field.numeric then
+            addition = addition:gsub("[^%d%.%-]", "")
+        end
+        field.value = (field.value .. addition):sub(1, field.maximum)
+        poiDialog.error = nil
+    elseif eventName == "mouse_click" then
+        local x, y = event[3], event[4]
+        if poiDialog.mode == "edit" then
+            for index, bounds in ipairs(poiDialog.fieldBounds or {}) do
+                if pointInside(x, y, bounds) then
+                    poiDialog.active = index
+                    return
+                end
+            end
+        end
+        for _, button in ipairs(poiDialog.buttons or {}) do
+            if pointInside(x, y, button) then
+                activatePoiDialogAction(button.action)
+                return
+            end
+        end
+    end
+end
+
+function openPoiMenu(identifier, x, y)
+    poiDialog = nil
+    poiMenu = {
+        poiId = identifier,
+        anchorX = x,
+        anchorY = y
+    }
+end
+
+function handlePoiMenuClick(x, y)
+    if not poiMenu then return false end
+    for _, button in ipairs(poiMenu.buttons or {}) do
+        if pointInside(x, y, button) then
+            local identifier = poiMenu.poiId
+            local action = button.action
+            poiMenu = nil
+            if action == "edit" then poiEditor(identifier)
+            elseif action == "delete" then deleteSelectedPoi(identifier) end
+            return true
+        end
+    end
+    poiMenu = nil
+    return true
 end
 
 function waypointEditor()
@@ -3493,6 +3736,8 @@ function inputLoop()
         if eventName == "terminate" then
             running = false
             return
+        elseif poiDialog then
+            handlePoiDialogEvent(event)
         elseif eventName == "char" then
             local character = event[2]:lower()
             if character == "+" or character == "=" then
@@ -3542,7 +3787,9 @@ function inputLoop()
             end
         elseif eventName == "key" then
             local key = event[2]
-            if key == keys.left then pan(-1, 0)
+            if key == keys.escape and poiMenu then
+                poiMenu = nil
+            elseif key == keys.left then pan(-1, 0)
             elseif key == keys.right then pan(1, 0)
             elseif key == keys.up then pan(0, -1)
             elseif key == keys.down then pan(0, 1)
@@ -3558,7 +3805,10 @@ function inputLoop()
             local _, button, mouseX, mouseY = table.unpack(event)
             local display = lastDisplayMap
             local handled = false
-            if display and display.buttons then
+            if poiMenu then
+                handled = handlePoiMenuClick(mouseX, mouseY)
+            end
+            if not handled and display and display.buttons then
                 for _, uiButton in ipairs(display.buttons) do
                     if mouseX >= uiButton.x1 and mouseX <= uiButton.x2
                         and mouseY >= uiButton.y1 and mouseY <= uiButton.y2 then
@@ -3574,6 +3824,9 @@ function inputLoop()
                 local poiId = poiAtPointer(mouseX, mouseY, display)
                 if poiId then
                     selectPoi(poiId)
+                    if button == 2 then
+                        openPoiMenu(poiId, mouseX, mouseY)
+                    end
                     handled = true
                 elseif button == 3 then
                     local worldX = display.mapViewX

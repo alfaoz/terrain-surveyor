@@ -32,6 +32,8 @@ local tileIndex = {}
 local aircraft = {}
 local logs = {}
 local selectedDrive = 1
+local selectedPoi = 1
+local poiDeleteConfirm
 local page = 1
 local notice = "STARTING"
 local job
@@ -57,7 +59,7 @@ local stats = {
     rejected = 0
 }
 
-local PAGE_NAMES = { "OVERVIEW", "STORAGE", "TRAFFIC", "LOG" }
+local PAGE_NAMES = { "OVERVIEW", "STORAGE", "TRAFFIC", "POIS", "LOG" }
 
 local function log(message, severity)
     logs[#logs + 1] = {
@@ -1281,6 +1283,69 @@ local function drawTraffic(width, height)
     if #contacts == 0 then writeAt(2, 6, "NO AIRCRAFT ONLINE", colors.gray) end
 end
 
+local function drawPois(width, height)
+    local list = poiList()
+    selectedPoi = math.max(1, math.min(selectedPoi, math.max(1, #list)))
+    writeAt(2, 4, ("SHARED POINTS OF INTEREST %d"):format(#list),
+        colors.lightBlue)
+    local top = 6
+    local visible = math.max(1, height - top - 7)
+    local first = math.max(1, math.min(selectedPoi, #list) - visible + 1)
+    for line = 0, visible - 1 do
+        local index = first + line
+        local poi = list[index]
+        if not poi then break end
+        local selected = index == selectedPoi
+        local row = ("%s%-20s %-10s %8d %8d"):format(
+            selected and ">" or " ",
+            fit(poi.name or "POINT", 20),
+            fit(poi.category or "GENERAL", 10),
+            poi.x or 0, poi.z or 0)
+        writeAt(2, top + line, fit(row, width - 3),
+            selected and colors.black or colors.white,
+            selected and colors.lightBlue or colors.black)
+        uiButtons[#uiButtons + 1] = {
+            x1 = 2,
+            x2 = math.max(2, width - 1),
+            y = top + line,
+            action = "select_poi:" .. index,
+            enabled = true
+        }
+    end
+    if #list == 0 then
+        writeAt(2, 6, "NO SHARED POIS SAVED", colors.gray)
+    end
+
+    local poi = list[selectedPoi]
+    if poi then
+        writeAt(2, height - 5, ("SELECTED %s  %s"):format(
+            fit(poi.name or "POINT", 24),
+            fit(poi.dimension or "-", 28)), colors.lightBlue)
+        writeAt(2, height - 4, ("X %d  Z %d  ALT %s  BY %s"):format(
+            poi.x, poi.z, tostring(poi.y or "-"),
+            tostring(poi.createdBy or "-")), colors.lightGray)
+    end
+
+    if poiDeleteConfirm then
+        local pending = poiStore.pois[poiDeleteConfirm]
+        if pending then
+            writeAt(2, height - 3,
+                fit("DELETE " .. pending.name
+                    .. " FOR EVERY AIRCRAFT?", width - 3),
+                colors.red)
+            local buttonX = 2
+            buttonX = drawButton(buttonX, height - 2,
+                "CANCEL", "poi_delete_cancel", true)
+            drawButton(buttonX, height - 2,
+                "CONFIRM DELETE", "poi_delete_confirm", true)
+        else
+            poiDeleteConfirm = nil
+        end
+    else
+        drawButton(2, height - 2, "DELETE", "poi_delete", poi ~= nil)
+    end
+end
+
 local function drawLogs(width, height)
     local visible = height - 5
     local first = math.max(1, #logs - visible + 1)
@@ -1304,6 +1369,7 @@ local function draw()
     if page == 1 then drawOverview(width, height)
     elseif page == 2 then drawStorage(width, height)
     elseif page == 3 then drawTraffic(width, height)
+    elseif page == 4 then drawPois(width, height)
     else drawLogs(width, height)
     end
     clearLine(height, colors.gray)
@@ -1313,7 +1379,36 @@ end
 
 local function performUiAction(action)
     local driveIndex = action:match("^select:(%d+)$")
-    if driveIndex then
+    local poiIndex = action:match("^select_poi:(%d+)$")
+    if poiIndex then
+        selectedPoi = tonumber(poiIndex)
+        poiDeleteConfirm = nil
+        local poi = poiList()[selectedPoi]
+        notice = poi and ("Selected POI " .. poi.name)
+            or "No POI selected"
+    elseif action == "poi_delete" then
+        local poi = poiList()[selectedPoi]
+        if poi then
+            poiDeleteConfirm = poi.id
+            notice = "Confirm shared POI deletion"
+        end
+    elseif action == "poi_delete_cancel" then
+        poiDeleteConfirm = nil
+        notice = "POI deletion cancelled"
+    elseif action == "poi_delete_confirm" and poiDeleteConfirm then
+        local identifier = poiDeleteConfirm
+        local poi = poiStore.pois[identifier]
+        local ok, failure = deletePoi(identifier)
+        if ok then
+            log("POI deleted locally: " .. tostring(
+                poi and poi.name or identifier))
+            selectedPoi = math.max(1, selectedPoi - 1)
+            notice = "Shared POI deleted"
+        else
+            log("POI delete failed: " .. tostring(failure), "ERROR")
+        end
+        poiDeleteConfirm = nil
+    elseif driveIndex then
         selectedDrive = math.max(1, math.min(#drives, tonumber(driveIndex)))
         local selected = drives[selectedDrive]
         notice = selected and ("Selected " .. selected.name) or "No drive selected"
@@ -1349,11 +1444,17 @@ local function uiLoop()
             draw()
         elseif event[1] == "char" then
             local character = event[2]:lower()
-            if character >= "1" and character <= "4" then
+            if character >= "1" and character <= "5" then
                 page = tonumber(character)
             elseif character == "q" then
                 running = false
                 return
+            elseif page == 4 and poiDeleteConfirm and character == "y" then
+                performUiAction("poi_delete_confirm")
+            elseif page == 4 and poiDeleteConfirm and character == "n" then
+                performUiAction("poi_delete_cancel")
+            elseif page == 4 and character == "d" then
+                performUiAction("poi_delete")
             elseif character == "m" then
                 performUiAction("maintenance")
             elseif character == "r" then
@@ -1369,7 +1470,21 @@ local function uiLoop()
             end
             draw()
         elseif event[1] == "key" then
-            if event[2] == keys.up then
+            if page == 4 then
+                if event[2] == keys.up then
+                    selectedPoi = math.max(1, selectedPoi - 1)
+                    poiDeleteConfirm = nil
+                elseif event[2] == keys.down then
+                    selectedPoi = math.min(
+                        math.max(1, tableCount(poiStore.pois)),
+                        selectedPoi + 1)
+                    poiDeleteConfirm = nil
+                elseif event[2] == keys.delete then
+                    performUiAction("poi_delete")
+                elseif event[2] == keys.escape and poiDeleteConfirm then
+                    performUiAction("poi_delete_cancel")
+                end
+            elseif event[2] == keys.up then
                 selectedDrive = math.max(1, selectedDrive - 1)
             elseif event[2] == keys.down then
                 selectedDrive = math.min(math.max(1, #drives), selectedDrive + 1)
