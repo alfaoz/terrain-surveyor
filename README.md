@@ -314,6 +314,12 @@ Its active tile-request queue is a bounded, center-out window over the visible
 map. Panning or zooming immediately prunes obsolete requests, while tiles that
 have already arrived remain in the persistent on-device cache.
 
+Before requesting terrain, the pocket downloads exact 32-by-32-chunk coverage
+bitmaps from the aircraft. Each 128-byte bitmap identifies which chunks are
+present in the aircraft or shared station catalog, so empty areas are rejected
+locally instead of becoming tile requests. The aircraft independently applies
+the same known-terrain check before forwarding anything to the station.
+
 Companion controls:
 
 - Left-click the map: append a waypoint to the aircraft's route

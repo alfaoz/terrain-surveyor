@@ -17,12 +17,12 @@ return {
             file = "allay/atlas-station.lua"
         },
         ["atlas-navigator"] = {
-            version = "1.5.1",
+            version = "1.5.2",
             description = "Shared CC:Graphics terrain, companion, POI, and waypoint navigator",
             file = "allay/atlas-navigator.lua"
         },
         ["atlas-companion"] = {
-            version = "1.0.3",
+            version = "1.0.4",
             description = "Paired pocket moving map and live aircraft route controller",
             file = "allay/atlas-companion.lua"
         }

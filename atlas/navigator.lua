@@ -329,6 +329,12 @@ local poiMenu
 
 local cacheIndex = atlas.readTable(CACHE_META_PATH) or {}
 cacheIndex.tiles = type(cacheIndex.tiles) == "table" and cacheIndex.tiles or {}
+knownLocalTerrain = {}
+knownServerTerrain = {}
+knownTerrainRevision = 0
+for cachedKey in pairs(cacheIndex.tiles) do
+    knownLocalTerrain[cachedKey] = true
+end
 
 local surveyor = findSurveyor()
 local tiles = {}
@@ -477,8 +483,67 @@ function companionSnapshot()
             status = scanStatus,
             chunksPerSecond = scanMetrics.chunksPerSecond,
             aheadSeconds = scanMetrics.aheadSeconds
-        }
+        },
+        knownTerrainRevision = knownTerrainRevision
     }
+end
+
+function terrainKnown(key)
+    return knownLocalTerrain[key] or knownServerTerrain[key] or false
+end
+
+function markTerrainKnown(key, source)
+    local before = terrainKnown(key)
+    local target = source == "server"
+        and knownServerTerrain or knownLocalTerrain
+    target[key] = true
+    if not before then
+        knownTerrainRevision = knownTerrainRevision + 1
+        return true
+    end
+    return false
+end
+
+function forgetTerrainKnown(key, source)
+    local before = terrainKnown(key)
+    if source == "server" then
+        knownServerTerrain[key] = nil
+    elseif source == "local" then
+        knownLocalTerrain[key] = nil
+    else
+        knownServerTerrain[key] = nil
+        knownLocalTerrain[key] = nil
+    end
+    if before and not terrainKnown(key) then
+        knownTerrainRevision = knownTerrainRevision + 1
+        return true
+    end
+    return false
+end
+
+function resetServerTerrainKnowledge()
+    knownServerTerrain = {}
+    knownTerrainRevision = knownTerrainRevision + 1
+end
+
+function companionGetCoverage(dimension, regionX, regionZ)
+    local bytes = {}
+    local originX = math.floor(regionX) * 32
+    local originZ = math.floor(regionZ) * 32
+    for localZ = 0, 31 do
+        for byteX = 0, 3 do
+            local value = 0
+            for bitIndex = 0, 7 do
+                local chunkX = originX + byteX * 8 + bitIndex
+                local chunkZ = originZ + localZ
+                if terrainKnown(tileKey(dimension, chunkX, chunkZ)) then
+                    value = value + 2 ^ bitIndex
+                end
+            end
+            bytes[#bytes + 1] = string.char(value)
+        end
+    end
+    return table.concat(bytes), knownTerrainRevision
 end
 
 function companionGetTile(dimension, chunkX, chunkZ)
@@ -492,6 +557,9 @@ function companionGetTile(dimension, chunkX, chunkZ)
     local raw = loadLocalRaw(dimension, chunkX, chunkZ)
     if raw then return raw, "data" end
     if nowMs() < (networkMissUntil[key] or 0) then
+        return nil, "missing"
+    end
+    if not terrainKnown(key) then
         return nil, "missing"
     end
     if serverId and linkStatus ~= "LOST" then
@@ -550,6 +618,7 @@ function startCompanionHost()
         callsign = function() return navConfig.callsign end,
         snapshot = companionSnapshot,
         getTile = companionGetTile,
+        getCoverage = companionGetCoverage,
         mutateRoute = companionMutateRoute
     })
     if not companionHost:host() then
@@ -900,12 +969,18 @@ function loadLocalRaw(dimension, chunkX, chunkZ)
                 cacheDirty = true
             end
         end
+        if not tiles[key] and not cacheWriteQueue[key] then
+            forgetTerrainKnown(key, "local")
+        end
         return nil
     end
     local raw = atlas.loadTile(path)
     if not raw then
         cacheIndex.tiles[key] = nil
         cacheDirty = true
+        if not tiles[key] and not cacheWriteQueue[key] then
+            forgetTerrainKnown(key, "local")
+        end
         return nil
     end
     cacheIndex.tiles[key] = entry or {
@@ -1281,6 +1356,7 @@ end
 function installRawTile(raw, source)
     local decoded = decodeTile(raw)
     local key = tileKey(decoded.dimension, decoded.chunkX, decoded.chunkZ)
+    markTerrainKnown(key, "local")
     local previous = tiles[key]
     local cached = cacheIndex.tiles[key]
     local pendingWrite = cacheWriteQueue[key]
@@ -2374,10 +2450,6 @@ function processCatalogMirror()
         and type(serverInfo.capabilities) == "table"
         and serverInfo.capabilities or {}
     if not capabilities.catalog or nowMs() < catalogState.nextAt then return end
-    if tableCount(downloadQueue)
-        > MAX_DOWNLOAD_QUEUE - CATALOG_POLICY.pageSize then
-        return
-    end
 
     local sent = sendPending("get_catalog", {
         cursor = catalogState.cursor,
@@ -2399,6 +2471,7 @@ function acceptCatalogPage(message)
     end
 
     if catalogState.revision ~= message.revision then
+        resetServerTerrainKnowledge()
         catalogState.revision = message.revision
     end
     if catalogState.cursor == 1 then
@@ -2417,6 +2490,7 @@ function acceptCatalogPage(message)
                 catalogEntry.dimension,
                 catalogEntry.chunkX,
                 catalogEntry.chunkZ)
+            markTerrainKnown(key, "server")
             catalogState.seen = catalogState.seen + 1
             local cached = cacheIndex.tiles[key]
             local path = cacheEntryPath(cached)
@@ -2720,6 +2794,7 @@ function handleDownloadItem(item, key, request)
         if raw then
             queueUpload(raw)
         else
+            forgetTerrainKnown(key, "server")
             networkMissUntil[key] = nowMs() + NETWORK_MISS_MS
         end
     elseif item.status == "unavailable" then
@@ -3234,6 +3309,7 @@ function evictCacheIfNeeded(extraBytes)
                         invalidateTileDependencies(
                             loaded.dimension, loaded.chunkX, loaded.chunkZ)
                     end
+                    forgetTerrainKnown(candidate.key, "local")
                     cacheDirty = true
                 end
             end
@@ -3916,6 +3992,10 @@ function openHomeMenu()
         pendingKeys = {}
         networkMissUntil = {}
         serverVerifiedAt = {}
+        resetServerTerrainKnowledge()
+        catalogState.revision = nil
+        catalogState.cursor = 1
+        catalogState.nextAt = 0
         serverId = selectedId
         serverInfo = selectedInfo
         if serverId then

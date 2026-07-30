@@ -14,6 +14,10 @@ STATE_LOST_MS = 3500
 TILE_TIMEOUT_MS = 3000
 TILE_BATCH_SIZE = 14
 MAX_TILE_QUEUE = 512
+COVERAGE_TIMEOUT_MS = 3000
+COVERAGE_TTL_MS = 3000
+COVERAGE_BATCH_SIZE = 16
+MAX_COVERAGE_QUEUE = 64
 VISIBLE_INSPECTIONS = 256
 MAP_EVENT = "atlas_companion_map"
 HEADER_HEIGHT = 15
@@ -77,6 +81,10 @@ tileCount = 0
 wantedTiles = {}
 wantedTileCount = 0
 tilePending = nil
+coverageRegions = {}
+coverageWanted = {}
+coverageWantedCount = 0
+coveragePending = nil
 missingUntil = {}
 terrainRevision = 0
 state = nil
@@ -206,6 +214,57 @@ function tileKey(dimension, chunkX, chunkZ)
     return atlas.tileKey(dimension, chunkX, chunkZ)
 end
 
+function coverageKey(dimension, regionX, regionZ)
+    return table.concat({
+        dimension, math.floor(regionX), math.floor(regionZ)
+    }, "|")
+end
+
+function removeCoverageWanted(key)
+    if not coverageWanted[key] then return false end
+    coverageWanted[key] = nil
+    coverageWantedCount = math.max(0, coverageWantedCount - 1)
+    return true
+end
+
+function clearCoverageState()
+    coverageRegions = {}
+    coverageWanted = {}
+    coverageWantedCount = 0
+    coveragePending = nil
+end
+
+function queueCoverageRegion(dimension, regionX, regionZ)
+    local key = coverageKey(dimension, regionX, regionZ)
+    if coverageWanted[key] or coveragePending
+        and coveragePending.keys[key] then return end
+    if coverageWantedCount >= MAX_COVERAGE_QUEUE then return end
+    coverageWanted[key] = {
+        dimension = dimension,
+        regionX = regionX,
+        regionZ = regionZ
+    }
+    coverageWantedCount = coverageWantedCount + 1
+end
+
+function coverageKnown(dimension, chunkX, chunkZ)
+    local regionX = math.floor(chunkX / 32)
+    local regionZ = math.floor(chunkZ / 32)
+    local key = coverageKey(dimension, regionX, regionZ)
+    local region = coverageRegions[key]
+    if not region or now() >= region.expiresAt then
+        coverageRegions[key] = nil
+        queueCoverageRegion(dimension, regionX, regionZ)
+        return nil
+    end
+    local localX = chunkX - regionX * 32
+    local localZ = chunkZ - regionZ * 32
+    local byteIndex = localZ * 4 + math.floor(localX / 8) + 1
+    local bitIndex = localX % 8
+    local value = region.data:byte(byteIndex) or 0
+    return math.floor(value / 2 ^ bitIndex) % 2 == 1
+end
+
 function removeWantedTile(key)
     if not wantedTiles[key] then return false end
     wantedTiles[key] = nil
@@ -245,6 +304,28 @@ function pruneWantedTiles(plan)
     for key, request in pairs(wantedTiles) do
         if not wantedTileInViewport(request, plan) then
             removeWantedTile(key)
+        end
+    end
+end
+
+function coverageInViewport(region, plan)
+    return region.dimension == plan.dimension
+        and region.regionX >= math.floor(plan.minX / 32)
+        and region.regionX <= math.floor(plan.maxX / 32)
+        and region.regionZ >= math.floor(plan.minZ / 32)
+        and region.regionZ <= math.floor(plan.maxZ / 32)
+end
+
+function pruneCoverage(plan)
+    for key, request in pairs(coverageWanted) do
+        if not coverageInViewport(request, plan) then
+            removeCoverageWanted(key)
+        end
+    end
+    for key, region in pairs(coverageRegions) do
+        if now() >= region.expiresAt
+            or not coverageInViewport(region, plan) then
+            coverageRegions[key] = nil
         end
     end
 end
@@ -462,6 +543,7 @@ function acceptConnection(identifier, message)
     navigatorId = identifier
     session = message.session
     clearWantedTiles()
+    clearCoverageState()
     viewportPlan = nil
     connected = true
     stateReceivedAt = now()
@@ -999,6 +1081,42 @@ function handleTiles(message)
     tilePending = nil
 end
 
+function handleCoverage(message)
+    if not coveragePending
+        or message.requestId ~= coveragePending.requestId
+        or type(message.regions) ~= "table" then return end
+    local current = now()
+    for _, region in ipairs(message.regions) do
+        if type(region) == "table"
+            and type(region.dimension) == "string"
+            and type(region.regionX) == "number"
+            and type(region.regionZ) == "number"
+            and type(region.data) == "string"
+            and #region.data == 128 then
+            local regionX = math.floor(region.regionX)
+            local regionZ = math.floor(region.regionZ)
+            local key = coverageKey(region.dimension, regionX, regionZ)
+            coverageRegions[key] = {
+                dimension = region.dimension,
+                regionX = regionX,
+                regionZ = regionZ,
+                data = region.data,
+                revision = region.revision,
+                expiresAt = current + COVERAGE_TTL_MS
+            }
+            removeCoverageWanted(key)
+        end
+    end
+    coveragePending = nil
+    if viewportPlan then resetViewportCursor(viewportPlan) end
+    for key, request in pairs(wantedTiles) do
+        if coverageKnown(
+            request.dimension, request.chunkX, request.chunkZ) == false then
+            removeWantedTile(key)
+        end
+    end
+end
+
 function handleNetworkMessage(sender, message)
     if sender ~= navigatorId or type(message) ~= "table"
         or message.atlas ~= atlas.VERSION then return end
@@ -1015,6 +1133,8 @@ function handleNetworkMessage(sender, message)
         statusText = "RECONNECTING"
     elseif message.op == "tiles_data" and message.session == session then
         handleTiles(message)
+    elseif message.op == "coverage_data" and message.session == session then
+        handleCoverage(message)
     elseif (message.op == "route_updated"
         or message.op == "route_rejected")
         and message.session == session then
@@ -1073,6 +1193,7 @@ function prepareViewport()
     }
     resetViewportCursor(nextPlan)
     pruneWantedTiles(nextPlan)
+    pruneCoverage(nextPlan)
     viewportPlan = nextPlan
 end
 
@@ -1088,14 +1209,18 @@ function inspectViewport()
             local key = tileKey(plan.dimension, chunkX, chunkZ)
             if not tiles[key] and now() >= (missingUntil[key] or 0) then
                 if not loadCachedTile(plan.dimension, chunkX, chunkZ) then
-                    queueWantedTile(key, {
-                        dimension = plan.dimension,
-                        chunkX = chunkX,
-                        chunkZ = chunkZ,
-                        priority = (chunkX - plan.centerX) ^ 2
-                            + (chunkZ - plan.centerZ) ^ 2,
-                        notBefore = 0
-                    })
+                    local known = coverageKnown(
+                        plan.dimension, chunkX, chunkZ)
+                    if known then
+                        queueWantedTile(key, {
+                            dimension = plan.dimension,
+                            chunkX = chunkX,
+                            chunkZ = chunkZ,
+                            priority = (chunkX - plan.centerX) ^ 2
+                                + (chunkZ - plan.centerZ) ^ 2,
+                            notBefore = 0
+                        })
+                    end
                 end
             end
         end
@@ -1118,6 +1243,30 @@ function nextTileBatch()
     end)
     while #choices > TILE_BATCH_SIZE do table.remove(choices) end
     return choices
+end
+
+function requestCoverage()
+    if not session or coveragePending then return end
+    local regions = {}
+    local keys = {}
+    for key, request in pairs(coverageWanted) do
+        regions[#regions + 1] = {
+            dimension = request.dimension,
+            regionX = request.regionX,
+            regionZ = request.regionZ
+        }
+        keys[key] = true
+        if #regions >= COVERAGE_BATCH_SIZE then break end
+    end
+    if #regions == 0 then return end
+    local requestId = sendCompanion("get_coverage", { regions = regions })
+    if requestId then
+        coveragePending = {
+            requestId = requestId,
+            sentAt = now(),
+            keys = keys
+        }
+    end
 end
 
 function requestTiles()
@@ -1169,7 +1318,13 @@ function networkLoop()
                 and current - tilePending.sentAt > TILE_TIMEOUT_MS then
                 tilePending = nil
             end
+            if coveragePending
+                and current - coveragePending.sentAt
+                    > COVERAGE_TIMEOUT_MS then
+                coveragePending = nil
+            end
             inspectViewport()
+            requestCoverage()
             requestTiles()
             timer = os.startTimer(NETWORK_SECONDS)
         end

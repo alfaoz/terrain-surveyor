@@ -8,6 +8,7 @@ local STORE_PATH = "/atlas/companions.dat"
 local SESSION_IDLE_MS = 15000
 local STATE_PUSH_MS = 200
 local MAX_TILE_REQUESTS = 14
+local MAX_COVERAGE_REQUESTS = 16
 
 local function now()
     return atlas.now()
@@ -231,6 +232,37 @@ function Host:handleTiles(sender, message, session)
     })
 end
 
+function Host:handleCoverage(sender, message, session)
+    local requests = type(message.regions) == "table"
+        and message.regions or {}
+    local regions = {}
+    for index = 1, math.min(#requests, MAX_COVERAGE_REQUESTS) do
+        local request = requests[index]
+        if type(request) == "table"
+            and type(request.dimension) == "string"
+            and type(request.regionX) == "number"
+            and type(request.regionZ) == "number" then
+            local regionX = math.floor(request.regionX)
+            local regionZ = math.floor(request.regionZ)
+            local data, revision = self.options.getCoverage(
+                request.dimension, regionX, regionZ)
+            if type(data) == "string" and #data == 128 then
+                regions[#regions + 1] = {
+                    dimension = request.dimension,
+                    regionX = regionX,
+                    regionZ = regionZ,
+                    data = data,
+                    revision = revision
+                }
+            end
+        end
+    end
+    self:reply(sender, message, "coverage_data", {
+        session = session.token,
+        regions = regions
+    })
+end
+
 function Host:handleRoute(sender, message, session)
     local ok, reason, snapshot = self.options.mutateRoute(
         message.op, message)
@@ -265,6 +297,8 @@ function Host:handle(sender, message)
         })
     elseif message.op == "get_tiles" then
         self:handleTiles(sender, message, session)
+    elseif message.op == "get_coverage" then
+        self:handleCoverage(sender, message, session)
     elseif message.op == "route_add"
         or message.op == "route_delete"
         or message.op == "route_set_active" then
@@ -302,6 +336,7 @@ function host.new(options)
     assert(type(options.callsign) == "function", "callsign callback required")
     assert(type(options.snapshot) == "function", "snapshot callback required")
     assert(type(options.getTile) == "function", "tile callback required")
+    assert(type(options.getCoverage) == "function", "coverage callback required")
     assert(type(options.mutateRoute) == "function", "route callback required")
     local stored = atlas.readTable(STORE_PATH) or {}
     local peers = {}
